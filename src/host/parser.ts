@@ -52,14 +52,14 @@ export function parseCommand(args: string[]): ParsedCommand | ParseError {
       return result;
     }
 
-    // Log level: -l0 to -l5
-    if (arg.startsWith('-l')) {
+    // Log level: -l0 to -l5 (must be -l followed by digit 0-5)
+    if (arg.startsWith('-l') && arg.length === 3) {
       const level = parseInt(arg.slice(2), 10);
-      if (level >= 0 && level <= 5) {
+      if (!isNaN(level) && level >= 0 && level <= 5) {
         result.logLevel = level;
+        i++;
+        continue;
       }
-      i++;
-      continue;
     }
 
     // Target device key: -t <key>
