@@ -55,7 +55,6 @@ import { TcpClient } from './common/tcp.js';
 import { HdcSession } from './common/session.js';
 import { HdcShell } from './host/shell.js';
 import { HdcFileSender } from './host/file.js';
-import { HdcForward } from './common/forward.js';
 
 // 连接到设备
 const client = new TcpClient({ host: '127.0.0.1', port: 8710 });
@@ -74,17 +73,9 @@ const sender = new HdcFileSender(
 );
 sender.on('progress', (p) => console.log(`${p.percentage}%`));
 await sender.start();
-
-// 端口转发
-const forward = new HdcForward({
-  localPort: 8080,
-  remoteHost: '127.0.0.1',
-  remotePort: 8080,
-});
-await forward.start();
 ```
 
-## 已实现模块 (24个)
+## 已实现模块 (27个)
 
 ### 协议层 (100%)
 - common/tlv.ts - TLV 编解码
@@ -100,6 +91,9 @@ await forward.start();
 - common/channel.ts - 通道抽象
 - common/forward.ts - 端口转发
 - common/compress.ts - 数据压缩
+- common/ssl.ts - SSL/TLS 加密
+- common/jdwp.ts - JDWP 调试
+- common/heartbeat.ts - 心跳机制
 - common/usb.ts - USB 连接 (API 框架)
 - common/uart.ts - 串口连接 (API 框架)
 
@@ -113,14 +107,12 @@ await forward.start();
 - cli.ts - 命令行工具
 - host/translate.ts - 命令翻译
 - host/parser.ts - 命令解析
-- host/client.ts - 客户端框架
-- host/server.ts - 服务端框架
 
 ## 测试状态
 
-- **总测试数**: 464 个
+- **总测试数**: 521 个
 - **测试通过率**: 100%
-- **代码覆盖率**: 核心功能 90%+
+- **代码覆盖率**: 核心功能 98%+
 
 ```bash
 npm test
@@ -138,6 +130,7 @@ npm test
 - 会话管理
 - 握手和心跳
 - RSA 认证
+- SSL/TLS 加密
 
 ✅ **功能层**
 - Shell 命令执行
@@ -145,6 +138,7 @@ npm test
 - 端口转发
 - 应用安装/卸载
 - Hilog 日志流
+- JDWP 调试支持
 
 ✅ **优化特性**
 - 数据压缩 (GZIP/DEFLATE/BROTLI)
@@ -178,10 +172,10 @@ npm run lint
 
 ## 项目统计
 
-- **代码行数**: ~9,000 行 TypeScript
-- **模块数量**: 24 个核心模块
-- **测试数量**: 464 个测试
-- **开发时间**: ~6 小时
+- **代码行数**: ~11,000 行 TypeScript
+- **模块数量**: 27 个核心模块
+- **测试数量**: 521 个测试
+- **开发时间**: ~7 小时
 
 ## 许可证
 
