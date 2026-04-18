@@ -10,6 +10,7 @@
  */
 
 import * as net from 'net';
+import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as child_process from 'child_process';
@@ -18,6 +19,8 @@ import { HdcClient } from './host/client.js';
 import { HdcServer } from './host/server.js';
 import { HdcAuth } from './common/auth.js';
 import { DEFAULT_PORT } from './common/protocol.js';
+
+const SERVER_PID_FILE = path.join(os.tmpdir(), '.HDCServer.pid');
 
 const VERSION = '0.0.1';
 
@@ -65,6 +68,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Handle kill locally - stop the official HDC server
+  if (parsed.command === 'kill') {
+    await runKill(parsed);
+    return;
+  }
+
+  // Handle start locally - ensure server is running
+  if (parsed.command === 'start') {
+    await runStart(parsed);
+    return;
+  }
+
   // Client mode - connect to server
   try {
     await runClient(parsed);
@@ -84,6 +99,9 @@ async function runServer(parsed: ParsedCommand): Promise<void> {
 
   const server = new HdcServer({ host, port });
 
+  // Write PID file so client can kill/restart us
+  fs.writeFileSync(SERVER_PID_FILE, String(process.pid));
+
   try {
     await server.start();
     console.log(`HDC server listening on ${host}:${port}`);
@@ -97,6 +115,7 @@ async function runServer(parsed: ParsedCommand): Promise<void> {
   const shutdown = async () => {
     console.log('\nShutting down server...');
     await server.stop();
+    try { fs.unlinkSync(SERVER_PID_FILE); } catch { /* ignore */ }
     process.exit(0);
   };
 
@@ -137,7 +156,7 @@ async function pullupServer(host: string, port: number): Promise<void> {
   const serverArgs = ['-m', '-s', `${host}:${port}`];
 
   const child = child_process.spawn(process.execPath, [
-    path.join(__dirname, 'cli.js'),
+    path.join(import.meta.dirname, 'cli.js'),
     ...serverArgs,
   ], {
     detached: true,
@@ -153,6 +172,27 @@ async function pullupServer(host: string, port: number): Promise<void> {
 // ============================================================================
 // Client Mode
 // ============================================================================
+
+/**
+ * Commands that don't need a target device (handled locally by server).
+ */
+function isLocalOnlyCommand(command: string): boolean {
+  const locals = ['list', 'kill', 'start', 'version', 'help', 'server', 'keygen', 'discover'];
+  return locals.includes(command);
+}
+
+/**
+ * Commands that need a target device.
+ */
+function isTargetCommand(command: string): boolean {
+  const targetCommands = [
+    'shell', 'file', 'install', 'uninstall', 'fport', 'rport',
+    'target', 'smode', 'tmode', 'hilog', 'jpid', 'track-jpid',
+    'bugreport', 'sideload', 'tconn', 'checkdevice', 'wait', 'any',
+    'update', 'flash', 'erase', 'format',
+  ];
+  return targetCommands.includes(command);
+}
 
 async function runClient(parsed: ParsedCommand): Promise<void> {
   const addr = parsed.serverAddr || getDefaultServerAddress();
@@ -171,11 +211,17 @@ async function runClient(parsed: ParsedCommand): Promise<void> {
     }
   }
 
+  // Determine connectKey: use -t value, or "any" for auto-select
+  let connectKey = parsed.targetKey || '';
+  if (!connectKey && parsed.command && isTargetCommand(parsed.command)) {
+    connectKey = 'any';
+  }
+
   // Connect to server via HdcClient
   const client = new HdcClient({
     host,
     port,
-    connectKey: parsed.targetKey,
+    connectKey,
   });
 
   await client.connect();
@@ -194,6 +240,97 @@ async function runClient(parsed: ParsedCommand): Promise<void> {
     }
   } finally {
     await client.disconnect();
+  }
+}
+
+// ============================================================================
+// Kill / Start Server
+// ============================================================================
+
+/**
+ * Read the HDC server PID from the PID file.
+ */
+function readServerPid(): number {
+  try {
+    const pidStr = fs.readFileSync(SERVER_PID_FILE, 'utf8').trim();
+    const pid = parseInt(pidStr, 10);
+    return isNaN(pid) ? 0 : pid;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Kill the HDC server daemon by PID.
+ * On non-OHOS, the official client reads PID from /tmp/.HDCServer.pid and sends SIGKILL.
+ */
+async function runKill(parsed: ParsedCommand): Promise<void> {
+  const isRestart = parsed.args.includes('-r');
+  const pid = readServerPid();
+
+  if (pid > 0) {
+    try {
+      process.kill(pid, 'SIGKILL');
+      console.log('Kill server finish');
+    } catch {
+      // Process may already be dead
+      console.log('Kill server finish');
+    }
+  } else {
+    // No PID file — try connecting and see if server responds
+    const addr = parsed.serverAddr || getDefaultServerAddress();
+    const { host, port } = parseServerAddress(addr);
+    const alive = await checkServerAlive(host, port);
+    if (!alive) {
+      console.log('No running HDC server found');
+      return;
+    }
+    // Server is alive but we don't know its PID — can't kill
+    console.log('Server is running but PID file not found. Kill it manually.');
+    return;
+  }
+
+  // Restart if requested
+  if (isRestart) {
+    await pullupServer(
+      ...(parsed.serverAddr
+        ? (() => { const a = parseServerAddress(parsed.serverAddr); return [a.host, a.port] as const; })()
+        : ['127.0.0.1', DEFAULT_PORT] as const),
+    );
+    console.log('Server restarted');
+  }
+}
+
+/**
+ * Start or restart the HDC server daemon.
+ */
+async function runStart(parsed: ParsedCommand): Promise<void> {
+  const isRestart = parsed.args.includes('-r');
+  const addr = parsed.serverAddr || getDefaultServerAddress();
+  const { host, port } = parseServerAddress(addr);
+
+  if (isRestart) {
+    // Kill existing server first
+    const pid = readServerPid();
+    if (pid > 0) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already dead */ }
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  const alive = await checkServerAlive(host, port);
+  if (alive && !isRestart) {
+    console.log('Server already running');
+    return;
+  }
+
+  await pullupServer(host, port);
+  const retryAlive = await checkServerAlive(host, port);
+  if (retryAlive) {
+    console.log('Server started');
+  } else {
+    console.error('Failed to start server');
+    process.exit(1);
   }
 }
 

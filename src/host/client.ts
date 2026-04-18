@@ -87,23 +87,25 @@ export class HdcClient extends EventEmitter {
   }
 
   /**
-   * Try to process channel handshake. The official server sends a 4-byte
-   * big-endian length prefix before the ChannelHandShake struct (value = 44).
-   * We also handle raw struct without prefix for our own server.
+   * Try to process channel handshake. The server sends a 4-byte
+   * big-endian length prefix before the ChannelHandShake struct.
+   * Short form = 44 bytes, long form = 108 bytes.
+   * We also handle raw struct without prefix.
    */
   private tryProcessChannelHandshake(): void {
-    // Check if buffer starts with 4-byte length prefix (value = 44)
+    // Check if buffer starts with 4-byte length prefix
     if (this.buffer.length >= 4) {
       const maybeLen = this.buffer.readUInt32BE(0);
-      if (maybeLen === 44 && this.buffer.length >= 4 + 44) {
-        this.processChannelHandshake(this.buffer.subarray(4, 4 + 44), 4 + 44);
+      if ((maybeLen === 44 || maybeLen === 108) && this.buffer.length >= 4 + maybeLen) {
+        this.processChannelHandshake(this.buffer.subarray(4, 4 + maybeLen), 4 + maybeLen);
         return;
       }
     }
 
     // Raw format: ChannelHandShake starts directly (for our own server)
     if (this.buffer.length >= 44 && this.buffer.toString('ascii', 0, 8) === 'OHOS HDC') {
-      this.processChannelHandshake(this.buffer.subarray(0, 44), 44);
+      const len = this.buffer.length >= 108 ? 108 : 44;
+      this.processChannelHandshake(this.buffer.subarray(0, len), len);
     }
   }
 
@@ -163,6 +165,7 @@ export class HdcClient extends EventEmitter {
   /**
    * Execute a command string and collect the response.
    * Sends a length-prefixed null-terminated command string.
+   * Resolves after receiving the first response frame or on close.
    */
   async executeCommand(command: string): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -172,21 +175,33 @@ export class HdcClient extends EventEmitter {
       }
 
       const chunks: Buffer[] = [];
+      let resolved = false;
       const timer = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
         this.off('response', handler);
         this.off('close', closeHandler);
         reject(new Error('Command timeout'));
       }, this.options.timeout);
 
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        this.off('response', handler);
+        this.off('close', closeHandler);
+        const result = Buffer.concat(chunks).toString('utf8').replace(/\0+$/, '');
+        resolve(result);
+      };
+
       const handler = (data: Buffer) => {
         chunks.push(data);
+        // Resolve after first response frame for simple commands
+        done();
       };
 
       const closeHandler = () => {
-        clearTimeout(timer);
-        this.off('response', handler);
-        const result = Buffer.concat(chunks).toString('utf8').replace(/\0+$/, '');
-        resolve(result);
+        done();
       };
 
       this.on('response', handler);

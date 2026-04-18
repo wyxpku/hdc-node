@@ -3,7 +3,7 @@
  *
  * Uses real TCP connections to test the server end-to-end.
  * The test client connects via raw TCP sockets and performs
- * the ChannelHandShake protocol manually.
+ * the ChannelHandShake protocol manually using length-prefixed framing.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -16,8 +16,32 @@ import {
 } from '../common/channel.js';
 
 /**
+ * Helper: wrap data in a 4-byte BE length prefix frame.
+ */
+function frame(data: Buffer | string): Buffer {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([len, buf]);
+}
+
+/**
+ * Helper: read a single length-prefixed frame from a buffer.
+ * Returns { frame, rest } or null if not enough data.
+ */
+function readFrame(buf: Buffer): { frame: Buffer; rest: Buffer } | null {
+  if (buf.length < 4) return null;
+  const len = buf.readUInt32BE(0);
+  if (buf.length < 4 + len) return null;
+  return {
+    frame: buf.subarray(4, 4 + len),
+    rest: buf.subarray(4 + len),
+  };
+}
+
+/**
  * Helper: connect a raw TCP client to the server and complete handshake.
- * Returns the socket, the received server handshake, and a data collector.
+ * Returns the socket, the received server handshake, and helpers.
  */
 async function connectClient(
   port: number,
@@ -35,53 +59,84 @@ async function connectClient(
     socket.on('error', reject);
 
     socket.connect(port, host, () => {
-      // Wait for server to send ChannelHandShake
+      // Wait for server to send length-prefixed ChannelHandShake
       const onData = (data: Buffer) => {
         receivedChunks.push(data);
         const total = Buffer.concat(receivedChunks);
 
-        // Need at least 44 bytes for a ChannelHandShake
-        if (total.length >= 44) {
-          socket.removeListener('data', onData);
+        // Server sends handshake with 4-byte BE length prefix
+        const result = readFrame(total);
+        if (!result) return;
 
-          const serverHs = decodeChannelHandShake(total.subarray(0, 108));
+        socket.removeListener('data', onData);
 
-          // Send client handshake response with a connectKey
-          const clientHs: ChannelHandShake = {
-            banner: 'OHOS HDC',
-            channelId: serverHs.channelId,
-            connectKey: 'test-device-key',
-            version: '3.2.0',
-          };
-          const clientHsBuf = encodeChannelHandShake(clientHs, true, true);
-          socket.write(clientHsBuf);
+        const serverHs = decodeChannelHandShake(result.frame);
 
-          resolve({
-            socket,
-            serverHandshake: serverHs,
-            collectData: () => {
-              return new Promise((res) => {
-                const chunks: Buffer[] = [];
-                const handler = (d: Buffer) => {
-                  chunks.push(d);
-                };
-                socket.on('data', handler);
-                // Give a small tick for data to arrive
-                setTimeout(() => {
-                  socket.removeListener('data', handler);
-                  res(Buffer.concat(chunks));
-                }, 100);
-              });
-            },
-            close: () => {
-              socket.destroy();
-            },
-          });
-        }
+        // Send client handshake response with length prefix
+        const clientHs: ChannelHandShake = {
+          banner: 'OHOS HDC',
+          channelId: serverHs.channelId,
+          connectKey: 'test-device-key',
+          version: '3.2.0',
+        };
+        const clientHsBuf = encodeChannelHandShake(clientHs, true, true);
+        socket.write(frame(clientHsBuf));
+
+        resolve({
+          socket,
+          serverHandshake: serverHs,
+          collectData: () => {
+            return new Promise((res) => {
+              const chunks: Buffer[] = [];
+              const handler = (d: Buffer) => {
+                chunks.push(d);
+              };
+              socket.on('data', handler);
+              setTimeout(() => {
+                socket.removeListener('data', handler);
+                res(Buffer.concat(chunks));
+              }, 100);
+            });
+          },
+          close: () => {
+            socket.destroy();
+          },
+        });
       };
 
       socket.on('data', onData);
     });
+  });
+}
+
+/**
+ * Helper: send a command with length prefix and read length-prefixed response.
+ */
+async function sendCommand(
+  clientSocket: net.Socket,
+  command: string,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    const handler = (data: Buffer) => {
+      chunks.push(data);
+    };
+    clientSocket.on('data', handler);
+
+    // Send command with length prefix
+    clientSocket.write(frame(command + '\n'));
+
+    setTimeout(() => {
+      clientSocket.removeListener('data', handler);
+      const total = Buffer.concat(chunks);
+      // Read length-prefixed response frame
+      const result = readFrame(total);
+      if (result) {
+        resolve(result.frame.toString('utf-8'));
+      } else {
+        resolve(total.toString('utf-8'));
+      }
+    }, 100);
   });
 }
 
@@ -90,7 +145,6 @@ describe('HdcServer', () => {
   let port: number;
 
   beforeEach(async () => {
-    // Use port 0 to get a random available port
     server = new HdcServer({ port: 0, host: '127.0.0.1' });
     await server.start();
     const addr = server.address() as net.AddressInfo;
@@ -98,7 +152,9 @@ describe('HdcServer', () => {
   });
 
   afterEach(async () => {
-    await server.stop();
+    if (server.isRunning()) {
+      await server.stop();
+    }
   });
 
   // ==========================================================================
@@ -155,11 +211,8 @@ describe('HdcServer', () => {
 
       const client = await connectClient(port);
 
-      // Server should have assigned a channelId via the handshake
       expect(client.serverHandshake.channelId).toBeGreaterThan(0);
       expect(client.serverHandshake.banner).toBe('OHOS HDC');
-
-      // Server should track the client
       expect(server.clientCount).toBe(1);
 
       client.close();
@@ -167,10 +220,7 @@ describe('HdcServer', () => {
 
     it('should complete handshake with client', async () => {
       const client = await connectClient(port);
-
-      // The server handshake should have a valid version
       expect(client.serverHandshake.version).toBeTruthy();
-
       client.close();
     });
 
@@ -186,7 +236,6 @@ describe('HdcServer', () => {
       const client3 = await connectClient(port);
       expect(server.clientCount).toBe(3);
 
-      // Each client should get a unique channelId
       expect(client1.serverHandshake.channelId).not.toBe(client2.serverHandshake.channelId);
       expect(client2.serverHandshake.channelId).not.toBe(client3.serverHandshake.channelId);
 
@@ -201,7 +250,6 @@ describe('HdcServer', () => {
 
       client.close();
 
-      // Wait a tick for the server to process the disconnect
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(server.clientCount).toBe(0);
     });
@@ -221,7 +269,6 @@ describe('HdcServer', () => {
       server.on('client-handshake', () => { handshakeFired = true; });
 
       const client = await connectClient(port);
-      // Give the server a tick to process the handshake
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(handshakeFired).toBe(true);
 
@@ -234,28 +281,8 @@ describe('HdcServer', () => {
   // ==========================================================================
 
   describe('local commands', () => {
-    async function sendCommand(
-      clientSocket: net.Socket,
-      command: string,
-    ): Promise<string> {
-      return new Promise((resolve) => {
-        const chunks: Buffer[] = [];
-        const handler = (data: Buffer) => {
-          chunks.push(data);
-        };
-        clientSocket.on('data', handler);
-        clientSocket.write(command + '\n');
-
-        setTimeout(() => {
-          clientSocket.removeListener('data', handler);
-          resolve(Buffer.concat(chunks).toString('utf-8'));
-        }, 100);
-      });
-    }
-
     it('should handle "list targets" with empty list', async () => {
       const client = await connectClient(port);
-      // Give server time to process handshake
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       const response = await sendCommand(client.socket, 'list targets');
@@ -288,7 +315,6 @@ describe('HdcServer', () => {
       const response = await sendCommand(client.socket, 'kill');
       expect(response).toContain('shutting down');
 
-      // Wait for shutdown to complete
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(server.isRunning()).toBe(false);
     });
@@ -303,7 +329,6 @@ describe('HdcServer', () => {
       expect(server.daemonSessionCount).toBe(0);
       expect(server.listDaemonKeys()).toEqual([]);
 
-      // Create a minimal mock session
       const mockSession = {
         close: () => {},
         getSocket: () => null,
@@ -369,7 +394,6 @@ describe('HdcServer', () => {
 
       await server.stop();
 
-      // Give a tick for sockets to be destroyed
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(server.clientCount).toBe(0);
 

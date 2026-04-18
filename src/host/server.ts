@@ -6,6 +6,7 @@
  * client's response with connectKey, and routes commands to the appropriate
  * daemon session.
  *
+ * Uses 4-byte BE length-prefixed framing matching the official HDC protocol.
  * Ported from: hdc_rust/src/host/server.rs
  */
 
@@ -25,6 +26,29 @@ import {
 import { PayloadProtect } from '../common/serialization.js';
 import { DEFAULT_PORT, CommandId, HDC_VERSION_STRING } from '../common/protocol.js';
 import { HdcSession } from '../common/session.js';
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/** Wrap data in a 4-byte BE length prefix frame (official protocol format). */
+function frame(data: Buffer | string): Buffer {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([len, buf]);
+}
+
+/** Read a single length-prefixed frame. Returns null if incomplete. */
+function readFrame(buf: Buffer): { frame: Buffer; rest: Buffer } | null {
+  if (buf.length < 4) return null;
+  const len = buf.readUInt32BE(0);
+  if (buf.length < 4 + len) return null;
+  return {
+    frame: buf.subarray(4, 4 + len),
+    rest: buf.subarray(4 + len),
+  };
+}
 
 // ============================================================================
 // Types
@@ -223,7 +247,7 @@ export class HdcServer extends EventEmitter {
     };
 
     const handshakeBuf = encodeChannelHandShake(handshake, true, true);
-    socket.write(handshakeBuf);
+    socket.write(frame(handshakeBuf));
 
     socket.on('data', (data: Buffer) => {
       this.handleClientData(client, data);
@@ -260,17 +284,29 @@ export class HdcServer extends EventEmitter {
 
   /**
    * Process the client's ChannelHandShake response.
+   * Clients send their handshake wrapped in a 4-byte BE length prefix.
    */
   private handleChannelHandshake(client: ClientConnection): void {
     try {
-      const hs = decodeChannelHandShake(client.buffer);
+      // Try length-prefixed format first (official protocol)
+      let hsBuf: Buffer;
+      let consumedBytes: number;
 
-      // Extract the connectKey from the handshake response
+      const maybeFrame = readFrame(client.buffer);
+      if (maybeFrame) {
+        hsBuf = maybeFrame.frame;
+        consumedBytes = client.buffer.length - maybeFrame.rest.length;
+      } else if (client.buffer.length >= 44 && client.buffer.toString('ascii', 0, 8) === 'OHOS HDC') {
+        // Raw format fallback
+        hsBuf = client.buffer.subarray(0, 44);
+        consumedBytes = 44;
+      } else {
+        return; // Not enough data yet
+      }
+
+      const hs = decodeChannelHandShake(hsBuf);
       client.connectKey = hs.connectKey;
       client.handshakeOK = true;
-
-      // Consume the handshake bytes (44 for short form, up to 108 for long form)
-      const consumedBytes = client.buffer.length >= 108 ? 108 : 44;
       client.buffer = client.buffer.subarray(consumedBytes);
 
       this.emit('client-handshake', client, hs);
@@ -283,40 +319,34 @@ export class HdcServer extends EventEmitter {
 
   /**
    * Process the command buffer after handshake is complete.
-   * Tries to parse HDC packets and extract commands.
+   * Reads 4-byte BE length-prefixed frames from the buffer.
    */
   private processCommandBuffer(client: ClientConnection): void {
-    // Try to parse as text command first (simpler local commands)
-    const text = client.buffer.toString('utf-8').trim();
-    if (text.length > 0) {
-      // Try to handle as local command
-      const handled = this.handleLocalCommand(client, text);
-      if (handled) {
-        client.buffer = Buffer.alloc(0);
-        return;
-      }
-    }
+    // Read all complete length-prefixed frames
+    while (client.buffer.length >= 4) {
+      const result = readFrame(client.buffer);
+      if (!result) break;
 
-    // Try to parse as HDC packet
-    if (client.buffer.length >= PACKET_HEADER_SIZE) {
-      const packet = parsePacket(client.buffer);
-      if (packet) {
-        const totalSize = PACKET_HEADER_SIZE + packet.header.headSize + packet.header.dataSize;
-        client.buffer = client.buffer.subarray(totalSize);
+      client.buffer = result.rest;
+      const frameData = result.frame;
 
-        // Extract text payload for command routing
-        const payloadStr = packet.payload.toString('utf-8').trim();
-        if (payloadStr.length > 0) {
-          this.handleCommand(client, payloadStr);
+      // Try to parse as HDC packet first
+      if (frameData.length >= PACKET_HEADER_SIZE) {
+        const packet = parsePacket(frameData);
+        if (packet) {
+          const payloadStr = packet.payload.toString('utf-8').trim();
+          if (payloadStr.length > 0) {
+            this.handleCommand(client, payloadStr);
+          }
+          continue;
         }
-        return;
       }
-    }
 
-    // If we can't parse it, try raw text for local commands
-    if (text.length > 0) {
-      this.handleCommand(client, text);
-      client.buffer = Buffer.alloc(0);
+      // Treat as text command
+      const text = frameData.toString('utf-8').trim();
+      if (text.length > 0) {
+        this.handleCommand(client, text);
+      }
     }
   }
 
@@ -331,8 +361,23 @@ export class HdcServer extends EventEmitter {
     }
 
     // For remote commands, forward to the daemon session matching connectKey
-    if (client.connectKey) {
-      const session = this.daemonSessions.get(client.connectKey);
+    // "any" means auto-select first available device
+    let key = client.connectKey;
+    if (key === 'any') {
+      const keys = this.listDaemonKeys();
+      if (keys.length === 0) {
+        client.socket.write(frame('No any target\n'));
+        return;
+      }
+      if (keys.length > 1) {
+        client.socket.write(frame('More than one target, use -t <key> to specify\n'));
+        return;
+      }
+      key = keys[0];
+    }
+
+    if (key) {
+      const session = this.daemonSessions.get(key);
       if (session) {
         // Forward raw data to the daemon session
         const payload = Buffer.from(command, 'utf-8');
@@ -353,7 +398,7 @@ export class HdcServer extends EventEmitter {
 
     // No daemon session found for remote command
     const response = `Error: no device found for key '${client.connectKey}'\n`;
-    client.socket.write(response);
+    client.socket.write(frame(response));
   }
 
   /**
@@ -361,7 +406,7 @@ export class HdcServer extends EventEmitter {
    * Returns true if the command was handled locally.
    */
   private handleLocalCommand(client: ClientConnection, command: string): boolean {
-    const trimmed = command.trim();
+    const trimmed = command.replace(/\0/g, '').trim();
     const lower = trimmed.toLowerCase();
 
     // list targets - list connected daemon sessions
@@ -373,38 +418,37 @@ export class HdcServer extends EventEmitter {
       } else {
         response = keys.join('\n') + `\n(${keys.length} devices)\n`;
       }
-      client.socket.write(response);
+      client.socket.write(frame(response));
       return true;
     }
 
     // tconn - connect to a device (for now, just acknowledge)
     if (lower.startsWith('tconn')) {
-      // Will be implemented with full remote routing
-      client.socket.write('tconn: not yet implemented\n');
+      client.socket.write(frame('tconn: not yet implemented\n'));
       return true;
     }
 
     // fport ls - list port forwards
     if (lower === 'fport ls' || lower.startsWith('fport ls ')) {
-      client.socket.write('fport ls: no forwards\n');
+      client.socket.write(frame('fport ls: no forwards\n'));
       return true;
     }
 
     // fport rm - remove port forward
     if (lower.startsWith('fport rm')) {
-      client.socket.write('fport rm: not yet implemented\n');
+      client.socket.write(frame('fport rm: not yet implemented\n'));
       return true;
     }
 
     // start - server is already running
     if (lower === 'start') {
-      client.socket.write('Server already running\n');
+      client.socket.write(frame('Server already running\n'));
       return true;
     }
 
     // kill - shutdown server
     if (lower === 'kill') {
-      client.socket.write('Server shutting down\n');
+      client.socket.write(frame('Server shutting down\n'));
       // Schedule shutdown so we can send the response first
       setImmediate(() => {
         this.stop();
@@ -414,7 +458,7 @@ export class HdcServer extends EventEmitter {
 
     // version - return version string
     if (lower === 'version') {
-      client.socket.write(`HDC ${HDC_VERSION_STRING}\n`);
+      client.socket.write(frame(`HDC ${HDC_VERSION_STRING}\n`));
       return true;
     }
 
