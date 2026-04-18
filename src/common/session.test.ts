@@ -2,7 +2,8 @@
  * Tests for session module
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as net from 'net';
 import {
   HdcSession,
   HdcSessionManager,
@@ -13,6 +14,13 @@ import {
   HANDSHAKE_MESSAGE,
   HDC_PROTOCOL_VERSION,
 } from './session.js';
+import {
+  encodeSessionHandShake,
+  decodeSessionHandShake,
+  SessionHandShake,
+} from './serialization.js';
+import { parsePacket, PACKET_HEADER_SIZE, PAYLOAD_PROTECT_VCODE } from './message.js';
+import { CommandId } from './protocol.js';
 
 describe('HdcSession', () => {
   let session: HdcSession;
@@ -267,9 +275,258 @@ describe('Constants', () => {
   it('should have correct handshake message', () => {
     expect(HANDSHAKE_MESSAGE).toBe('OHOS HDC');
   });
-  
+
   it('should have protocol version', () => {
     expect(HDC_PROTOCOL_VERSION).toBe(1);
+  });
+});
+
+describe('Protobuf Session Handshake', () => {
+  it('should encode and decode a SessionHandShake round-trip', () => {
+    const hs: SessionHandShake = {
+      banner: 'OHOS HDC',
+      authType: 0,
+      sessionId: 12345,
+      connectKey: 'test-key',
+      buf: '',
+      version: '1',
+    };
+
+    const encoded = encodeSessionHandShake(hs);
+    expect(encoded).toBeInstanceOf(Buffer);
+    expect(encoded.length).toBeGreaterThan(0);
+
+    const decoded = decodeSessionHandShake(encoded);
+    expect(decoded.banner).toBe('OHOS HDC');
+    expect(decoded.authType).toBe(0);
+    expect(decoded.sessionId).toBe(12345);
+    expect(decoded.connectKey).toBe('test-key');
+    expect(decoded.version).toBe('1');
+    expect(decoded.buf).toBe('');
+  });
+
+  it('should encode and decode a SessionHandShake with buf field', () => {
+    const hs: SessionHandShake = {
+      banner: 'OHOS HDC',
+      authType: 1,
+      sessionId: 99999,
+      connectKey: '',
+      buf: 'some-auth-data',
+      version: '2',
+    };
+
+    const encoded = encodeSessionHandShake(hs);
+    const decoded = decodeSessionHandShake(encoded);
+
+    expect(decoded.banner).toBe('OHOS HDC');
+    expect(decoded.authType).toBe(1);
+    expect(decoded.sessionId).toBe(99999);
+    expect(decoded.connectKey).toBe('');
+    expect(decoded.buf).toBe('some-auth-data');
+    expect(decoded.version).toBe('2');
+  });
+
+  it('should handle default/empty values in protobuf encoding', () => {
+    const hs: SessionHandShake = {
+      banner: '',
+      authType: 0,
+      sessionId: 0,
+      connectKey: '',
+      buf: '',
+      version: '',
+    };
+
+    const encoded = encodeSessionHandShake(hs);
+    // All fields are default/empty, so protobuf should produce minimal output
+    expect(encoded.length).toBe(0);
+
+    const decoded = decodeSessionHandShake(encoded);
+    expect(decoded.banner).toBe('');
+    expect(decoded.authType).toBe(0);
+    expect(decoded.sessionId).toBe(0);
+    expect(decoded.connectKey).toBe('');
+    expect(decoded.buf).toBe('');
+    expect(decoded.version).toBe('');
+  });
+});
+
+describe('Session Handshake over Socket', () => {
+  it('should send a protobuf-encoded handshake packet on attachSocket', async () => {
+    const session = new HdcSession({
+      serverOrDaemon: true,
+      connType: ConnType.CONN_TCP,
+      sessionId: 42,
+    });
+
+    const writtenChunks: Buffer[] = [];
+    const fakeSocket = new net.Socket();
+    // Capture written data
+    fakeSocket.write = vi.fn((data: Buffer) => {
+      writtenChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      return true;
+    });
+    fakeSocket.on = vi.fn();
+    fakeSocket.end = vi.fn();
+
+    session.attachSocket(fakeSocket as unknown as net.Socket);
+
+    // Should have written one packet
+    expect(fakeSocket.write).toHaveBeenCalledTimes(1);
+    const packetBuf = writtenChunks[0];
+
+    // Parse the packet using the message module
+    const parsed = parsePacket(packetBuf);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.protect.commandFlag).toBe(CommandId.CMD_KERNEL_HANDSHAKE);
+    expect(parsed!.protect.vCode).toBe(PAYLOAD_PROTECT_VCODE);
+
+    // Decode the handshake payload as protobuf
+    const handshake = decodeSessionHandShake(parsed!.payload);
+    expect(handshake.banner).toBe('OHOS HDC');
+    expect(handshake.authType).toBe(AuthType.AUTH_NONE);
+    expect(handshake.sessionId).toBe(42);
+    expect(handshake.connectKey).toBe('');
+    expect(handshake.version).toBe(String(HDC_PROTOCOL_VERSION));
+
+    session.close();
+  });
+
+  it('should decode protobuf handshake response and transition to READY', async () => {
+    const session = new HdcSession({
+      serverOrDaemon: true,
+      connType: ConnType.CONN_TCP,
+      sessionId: 100,
+    });
+
+    // Set session to HANDSHAKE state (simulating sendHandshake was called)
+    session['state'] = SessionState.HANDSHAKE;
+
+    // Build a protobuf-encoded handshake response
+    const responseHs: SessionHandShake = {
+      banner: 'OHOS HDC',
+      authType: AuthType.AUTH_NONE,
+      sessionId: 200,
+      connectKey: 'device-key',
+      buf: '',
+      version: '1',
+    };
+    const responsePayload = encodeSessionHandShake(responseHs);
+
+    // Wrap in a proper packet with CMD_KERNEL_HANDSHAKE
+    const { createPacket } = await import('./message.js');
+    const packet = createPacket(responsePayload, {
+      channelId: 0,
+      commandFlag: CommandId.CMD_KERNEL_HANDSHAKE,
+      checkSum: 0,
+      vCode: PAYLOAD_PROTECT_VCODE,
+    });
+
+    // Listen for the handshake event
+    const handshakePromise = new Promise<SessionHandShake>((resolve) => {
+      session.on('handshake', resolve);
+    });
+
+    // Simulate receiving data via onData
+    session['onData'](packet);
+
+    const result = await handshakePromise;
+    expect(result.banner).toBe('OHOS HDC');
+    expect(result.authType).toBe(AuthType.AUTH_NONE);
+    expect(result.sessionId).toBe(200);
+    expect(result.connectKey).toBe('device-key');
+    expect(result.version).toBe('1');
+
+    expect(session.state).toBe(SessionState.READY);
+    expect(session.authType).toBe(AuthType.AUTH_NONE);
+    expect(session.version).toBe('1');
+
+    session.close();
+  });
+
+  it('should handle handshake response with buf field containing auth data', async () => {
+    const session = new HdcSession({
+      serverOrDaemon: true,
+      connType: ConnType.CONN_TCP,
+      sessionId: 300,
+    });
+
+    session['state'] = SessionState.HANDSHAKE;
+
+    const responseHs: SessionHandShake = {
+      banner: 'OHOS HDC',
+      authType: AuthType.AUTH_TOKEN,
+      sessionId: 400,
+      connectKey: 'auth-test-key',
+      buf: 'tlv-auth-token-data',
+      version: '3',
+    };
+    const responsePayload = encodeSessionHandShake(responseHs);
+
+    const { createPacket } = await import('./message.js');
+    const packet = createPacket(responsePayload, {
+      channelId: 0,
+      commandFlag: CommandId.CMD_KERNEL_HANDSHAKE,
+      checkSum: 0,
+      vCode: PAYLOAD_PROTECT_VCODE,
+    });
+
+    const handshakePromise = new Promise<SessionHandShake>((resolve) => {
+      session.on('handshake', resolve);
+    });
+
+    session['onData'](packet);
+
+    const result = await handshakePromise;
+    expect(result.buf).toBe('tlv-auth-token-data');
+    expect(result.authType).toBe(AuthType.AUTH_TOKEN);
+    expect(session.authType).toBe(AuthType.AUTH_TOKEN);
+    expect(session.version).toBe('3');
+
+    session.close();
+  });
+
+  it('should process fragmented packets correctly', async () => {
+    const session = new HdcSession({
+      serverOrDaemon: true,
+      connType: ConnType.CONN_TCP,
+      sessionId: 500,
+    });
+
+    session['state'] = SessionState.HANDSHAKE;
+
+    const responseHs: SessionHandShake = {
+      banner: 'OHOS HDC',
+      authType: AuthType.AUTH_NONE,
+      sessionId: 600,
+      connectKey: '',
+      buf: '',
+      version: '1',
+    };
+    const responsePayload = encodeSessionHandShake(responseHs);
+
+    const { createPacket } = await import('./message.js');
+    const packet = createPacket(responsePayload, {
+      channelId: 0,
+      commandFlag: CommandId.CMD_KERNEL_HANDSHAKE,
+      checkSum: 0,
+      vCode: PAYLOAD_PROTECT_VCODE,
+    });
+
+    const handshakePromise = new Promise<SessionHandShake>((resolve) => {
+      session.on('handshake', resolve);
+    });
+
+    // Send the packet in two fragments
+    const mid = Math.floor(packet.length / 2);
+    session['onData'](packet.subarray(0, mid));
+    session['onData'](packet.subarray(mid));
+
+    const result = await handshakePromise;
+    expect(result.banner).toBe('OHOS HDC');
+    expect(result.sessionId).toBe(600);
+    expect(session.state).toBe(SessionState.READY);
+
+    session.close();
   });
 });
 

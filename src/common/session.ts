@@ -12,9 +12,10 @@
 
 import { EventEmitter } from 'events';
 import * as net from 'net';
-import { parsePacket, PacketParseResult } from './message.js';
-import { PKG_PAYLOAD_MAX_SIZE } from './protocol.js';
+import { parsePacket, PacketParseResult, createPacket, PACKET_HEADER_SIZE, PAYLOAD_PROTECT_VCODE } from './message.js';
+import { PKG_PAYLOAD_MAX_SIZE, CommandId } from './protocol.js';
 import { GetRuntimeMSec, GetRandomU32 } from './base.js';
+import { PayloadProtect, encodeSessionHandShake, decodeSessionHandShake, SessionHandShake } from './serialization.js';
 
 // ============================================================================
 // Types and Constants
@@ -65,13 +66,8 @@ export const HEARTBEAT_INTERVAL = 10000;
 // Interfaces
 // ============================================================================
 
-export interface SessionHandshake {
-  banner: string;
-  authType: AuthType;
-  sessionId: number;
-  connectKey: string;
-  version: string;
-}
+// Re-export SessionHandShake from serialization module
+export type { SessionHandShake } from './serialization.js';
 
 export interface SessionOptions {
   serverOrDaemon: boolean;
@@ -172,65 +168,39 @@ export class HdcSession extends EventEmitter {
    */
   private sendHandshake(): void {
     this.state = SessionState.HANDSHAKE;
-    
-    const handshake: SessionHandshake = {
+
+    const handshake: SessionHandShake = {
       banner: HANDSHAKE_MESSAGE,
       authType: AuthType.AUTH_NONE,
       sessionId: this.sessionId,
       connectKey: this.connectKey,
+      buf: '',
       version: String(HDC_PROTOCOL_VERSION),
     };
-    
-    const payload = this.buildHandshakePayload(handshake);
-    const packet = this.buildPacket(payload);
-    
+
+    const payload = encodeSessionHandShake(handshake);
+    const protect: PayloadProtect = {
+      channelId: 0,
+      commandFlag: CommandId.CMD_KERNEL_HANDSHAKE,
+      checkSum: 0,
+      vCode: PAYLOAD_PROTECT_VCODE,
+    };
+    const packet = createPacket(payload, protect);
+
     this.socket?.write(packet);
     this.updateActivity();
   }
   
   /**
-   * Build handshake payload
+   * Build PayloadProtect for a given channel and command
    */
-  private buildHandshakePayload(handshake: SessionHandshake): Buffer {
-    const parts: Buffer[] = [];
-    
-    // Banner (12 bytes)
-    const bannerBuf = Buffer.alloc(12);
-    bannerBuf.write(handshake.banner, 0, 'utf8');
-    parts.push(bannerBuf);
-    
-    // Session ID (4 bytes)
-    const sessionIdBuf = Buffer.alloc(4);
-    sessionIdBuf.writeUInt32BE(handshake.sessionId, 0);
-    parts.push(sessionIdBuf);
-    
-    // Auth type (1 byte)
-    parts.push(Buffer.from([handshake.authType]));
-    
-    // Connect key (variable)
-    const connectKeyBuf = Buffer.from(handshake.connectKey, 'utf8');
-    const keyLenBuf = Buffer.alloc(2);
-    keyLenBuf.writeUInt16BE(connectKeyBuf.length, 0);
-    parts.push(keyLenBuf);
-    parts.push(connectKeyBuf);
-    
-    // Version (variable)
-    const versionBuf = Buffer.from(handshake.version, 'utf8');
-    const verLenBuf = Buffer.alloc(2);
-    verLenBuf.writeUInt16BE(versionBuf.length, 0);
-    parts.push(verLenBuf);
-    parts.push(versionBuf);
-    
-    return Buffer.concat(parts);
-  }
-  
-  /**
-   * Build packet with size prefix
-   */
-  private buildPacket(payload: Buffer): Buffer {
-    const sizeBuf = Buffer.alloc(4);
-    sizeBuf.writeUInt32BE(payload.length, 0);
-    return Buffer.concat([sizeBuf, payload]);
+  private buildProtect(channelId: number = 0, commandFlag: number = 0): PayloadProtect {
+    return {
+      channelId,
+      commandFlag,
+      checkSum: 0,
+      vCode: PAYLOAD_PROTECT_VCODE,
+    };
   }
   
   /**
@@ -246,23 +216,25 @@ export class HdcSession extends EventEmitter {
    * Process buffered data
    */
   private processBuffer(): void {
-    while (this.buffer.length >= 4) {
-      const packetSize = this.buffer.readUInt32BE(0);
-      
-      if (packetSize <= 0 || packetSize > PKG_PAYLOAD_MAX_SIZE) {
-        this.emit('error', new Error(`Invalid packet size: ${packetSize}`));
+    while (this.buffer.length >= PACKET_HEADER_SIZE) {
+      // Read headSize from offset 5 (uint16 BE) and dataSize from offset 7 (uint32 BE)
+      const headSize = this.buffer.readUInt16BE(5);
+      const dataSize = this.buffer.readUInt32BE(7);
+      const totalSize = PACKET_HEADER_SIZE + headSize + dataSize;
+
+      if (totalSize <= 0 || totalSize > PACKET_HEADER_SIZE + PKG_PAYLOAD_MAX_SIZE) {
+        this.emit('error', new Error(`Invalid packet size: ${totalSize}`));
         this.close();
         return;
       }
-      
-      const totalSize = 4 + packetSize;
+
       if (this.buffer.length < totalSize) {
         break;
       }
-      
+
       const packetData = this.buffer.subarray(0, totalSize);
       this.buffer = this.buffer.subarray(totalSize);
-      
+
       try {
         const packet = parsePacket(packetData);
         if (!packet) continue;
@@ -289,45 +261,18 @@ export class HdcSession extends EventEmitter {
    */
   private handleHandshakeResponse(packet: PacketParseResult): void {
     try {
-      const handshake = this.parseHandshakePayload(packet.payload);
+      const handshake = decodeSessionHandShake(packet.payload);
       this.authType = handshake.authType;
       this.version = handshake.version;
-      
+
       this.state = SessionState.READY;
       this.startHeartbeat();
-      
+
       this.emit('handshake', handshake);
     } catch (err) {
       this.emit('error', err as Error);
       this.close();
     }
-  }
-  
-  /**
-   * Parse handshake payload
-   */
-  private parseHandshakePayload(payload: Buffer): SessionHandshake {
-    let offset = 0;
-    
-    const banner = payload.subarray(offset, offset + 12).toString('utf8').replace(/\0/g, '');
-    offset += 12;
-    
-    const sessionId = payload.readUInt32BE(offset);
-    offset += 4;
-    
-    const authType = payload.readUInt8(offset);
-    offset += 1;
-    
-    const keyLen = payload.readUInt16BE(offset);
-    offset += 2;
-    const connectKey = payload.subarray(offset, offset + keyLen).toString('utf8');
-    offset += keyLen;
-    
-    const verLen = payload.readUInt16BE(offset);
-    offset += 2;
-    const version = payload.subarray(offset, offset + verLen).toString('utf8');
-    
-    return { banner, authType, sessionId, connectKey, version };
   }
   
   /**
@@ -359,19 +304,20 @@ export class HdcSession extends EventEmitter {
   private sendHeartbeat(): void {
     const payload = Buffer.alloc(8);
     payload.writeBigUInt64BE(BigInt(GetRuntimeMSec()), 0);
-    this.sendRaw(payload);
+    this.sendRaw(payload, 0, CommandId.CMD_HEARTBEAT_MSG);
   }
   
   /**
    * Send raw data
    */
-  private sendRaw(data: Buffer): boolean {
+  private sendRaw(data: Buffer, channelId: number = 0, commandFlag: number = 0): boolean {
     if (!this.socket || this.state !== SessionState.READY) {
       return false;
     }
-    
-    const packet = this.buildPacket(data);
-    
+
+    const protect = this.buildProtect(channelId, commandFlag);
+    const packet = createPacket(data, protect);
+
     try {
       this.socket.write(packet);
       this.updateActivity();
@@ -385,7 +331,11 @@ export class HdcSession extends EventEmitter {
    * Send data through this session
    */
   send(commandFlag: number, data: Buffer | Uint8Array, channelId: number = 0): boolean {
-    return this.sendRaw(data instanceof Uint8Array ? Buffer.from(data) : data);
+    return this.sendRaw(
+      data instanceof Uint8Array ? Buffer.from(data) : data,
+      channelId,
+      commandFlag,
+    );
   }
   
   /**

@@ -10,9 +10,11 @@ export interface ParsedCommand {
   args: string[];
   targetKey?: string;
   serverAddr?: string;
+  forwardIP?: string;
   logLevel: number;
   runInServer: boolean;
   spawnedServer: boolean;
+  skipPullup: boolean;
 }
 
 export class ParseError extends Error {
@@ -35,6 +37,7 @@ export function parseCommand(args: string[]): ParsedCommand | ParseError {
     logLevel: DEFAULT_LOG_LEVEL,
     runInServer: false,
     spawnedServer: false,
+    skipPullup: false,
   };
 
   let i = 0;
@@ -82,7 +85,31 @@ export function parseCommand(args: string[]): ParsedCommand | ParseError {
       continue;
     }
 
-    // Server mode
+    // Forward listen IP: -e <ip>
+    if (arg === '-e') {
+      if (i + 1 >= args.length) {
+        return new ParseError('Error: -e requires an IP address');
+      }
+      result.forwardIP = args[++i];
+      i++;
+      continue;
+    }
+
+    // Server mode: -m
+    if (arg === '-m') {
+      result.runInServer = true;
+      i++;
+      continue;
+    }
+
+    // Skip server auto-pull-up: -p
+    if (arg === '-p') {
+      result.skipPullup = true;
+      i++;
+      continue;
+    }
+
+    // Server mode (long forms)
     if (arg === '--server' || arg === '-S') {
       result.runInServer = true;
       i++;
@@ -125,33 +152,57 @@ Options:
   -l[0-5]         Set log level (0=off, 1=fatal, 2=error, 3=warn, 4=info, 5=debug)
   -t <key>        Specify target device by key
   -s [ip:]port    Connect to server at address
-  -S, --server    Run as HDC server daemon
+  -e <ip>         Forward listen IP address
+  -m              Run as HDC server daemon
+  -p              Skip server auto-pull-up
+  -S, --server    Run as HDC server daemon (same as -m)
 
 Commands:
-  list targets              List connected devices
-  tconn <key> [-remove]     Connect/disconnect TCP device
-  tmode usb                 Switch device to USB mode
-  tmode port <port>         Switch device to TCP mode
-  shell [command]           Run shell command on device
-  file send <local> <remote>   Send file to device
-  file recv <remote> <local>   Receive file from device
-  install <package>         Install application
-  uninstall <package>       Uninstall application
-  fport <local> <remote>    Forward port
-  rport <remote> <local>    Reverse forward port
-  fport ls                  List port forwards
-  fport rm <task>           Remove port forward
-  hilog                     View device logs
-  jpid                      List JDWP debuggable processes
-  target boot               Reboot device
-  smode [-r]                Start/stop server daemon
-  kill                      Kill server daemon
+  list targets                     List connected devices
+  tconn <key> [-remove]            Connect/disconnect TCP device
+  tmode usb                        Switch device to USB mode
+  tmode port [port]                Switch device to TCP mode
+  shell [command]                  Run shell command on device
+  file send <local> <remote>       Send file to device
+  file recv <remote> <local>       Receive file from device
+  install <package>                Install application
+  uninstall <package>              Uninstall application
+  fport <local> <remote>           Forward port
+  rport <remote> <local>           Reverse forward port
+  fport ls                         List port forwards
+  fport rm <task>                  Remove port forward
+  hilog [options]                  View device logs
+  jpid                             List JDWP debuggable processes
+  track-jpid [-a|-p]              Track JDWP processes
+  target mount                     Remount partitions read/write
+  target boot [-bootloader|-recovery|MODE]  Reboot device
+  smode [-r]                       Toggle root mode (-r to disable)
+  discover                         LAN device discovery
+  checkserver                      Check client-server version
+  checkdevice <key>                Check device serial
+  wait                             Wait for device
+  any                              Connect first ready device
+  bugreport [FILE]                 Generate bug report
+  sideload <path>                  Sideload OTA package
+  keygen <FILE>                    Generate RSA keypair
+  update <pkg>                     Flash update package
+  flash [-f] <partition> <image>   Flash partition with image
+  erase [-f] <partition>           Erase partition
+  format [-f] <partition>          Format partition
+  start [-r]                       Start/restart HDC server
+  kill                             Kill server daemon
+  server                           Start server (same as -m)
 
 Examples:
   hdc list targets
   hdc -t 192.168.1.100:5555 shell
   hdc file send ./app.hap /data/local/tmp/
   hdc install /data/local/tmp/app.hap
+  hdc tconn 192.168.1.100:5555
+  hdc tconn 192.168.1.100:5555 -remove
+  hdc target boot -bootloader
+  hdc smode
+  hdc keygen ~/.hdc/keypair
 `;
 }
 
@@ -167,8 +218,30 @@ export function getDefaultServerAddress(): string {
  */
 export function parseServerAddress(addr: string): { host: string; port: number } {
   if (addr.includes(':')) {
-    const [host, portStr] = addr.split(':');
+    const lastColon = addr.lastIndexOf(':');
+    const host = addr.substring(0, lastColon);
+    const portStr = addr.substring(lastColon + 1);
     return { host, port: parseInt(portStr, 10) || DEFAULT_SERVER_PORT };
   }
   return { host: '127.0.0.1', port: parseInt(addr, 10) || DEFAULT_SERVER_PORT };
+}
+
+/**
+ * Build a command string from a parsed command to send to the server.
+ * Reconstructs the original command from the parsed result.
+ */
+export function buildCommandString(parsed: ParsedCommand): string {
+  const parts: string[] = [];
+
+  if (parsed.targetKey) {
+    parts.push('-t', parsed.targetKey);
+  }
+  if (parsed.forwardIP) {
+    parts.push('-e', parsed.forwardIP);
+  }
+
+  parts.push(parsed.command);
+  parts.push(...parsed.args);
+
+  return parts.join(' ');
 }

@@ -7,8 +7,10 @@
 
 import { EventEmitter } from 'events';
 import * as net from 'net';
-import { createPacket, parsePacket } from '../common/message.js';
-import { GetRandomString } from '../common/base.js';
+import { createPacket, parsePacket, PAYLOAD_PROTECT_VCODE } from '../common/message.js';
+import { CommandId } from '../common/protocol.js';
+import { GetRandomString, TlvAppend, TlvToStringMap } from '../common/base.js';
+import { PayloadProtect } from '../common/serialization.js';
 
 // ============================================================================
 // Constants
@@ -18,6 +20,12 @@ export const SHELL_PREFIX = 'shell:';
 export const SHELL_INITIAL = 'shell:init';
 export const SHELL_DATA = 'shell:data';
 export const SHELL_SIGNAL = 'shell:signal';
+
+// Extended shell TLV option tag names
+export const SHELL_OPT_BUNDLE_NAME = 'optBundleName';
+export const SHELL_OPT_ABILITY_TYPE = 'optAbilityType';
+export const SHELL_OPT_ABILITY_NAME = 'optAbilityName';
+export const SHELL_OPT_COMMAND = 'optShellCmd';
 
 export enum ShellState {
   IDLE = 'idle',
@@ -33,6 +41,19 @@ export enum ShellSignal {
   SIGQUIT = 3,  // Ctrl+\
   SIGKILL = 9,  // Force kill
   SIGTERM = 15, // Terminate
+}
+
+// ============================================================================
+// Helper
+// ============================================================================
+
+function shellProtect(commandFlag: number = 0): PayloadProtect {
+  return {
+    channelId: 0,
+    commandFlag,
+    checkSum: 0,
+    vCode: PAYLOAD_PROTECT_VCODE,
+  };
 }
 
 // ============================================================================
@@ -53,6 +74,14 @@ export interface ShellSession {
   state: ShellState;
   exitCode: number | null;
   startTime: number;
+}
+
+/** Options for extended shell (TLV-encoded parameters) */
+export interface ExtendedShellOptions {
+  bundleName: string;
+  abilityType?: string;
+  abilityName?: string;
+  command?: string;
 }
 
 // ============================================================================
@@ -118,7 +147,7 @@ export class HdcShell extends EventEmitter {
 
     // Send shell init command
     const initPayload = Buffer.from(`${SHELL_INITIAL}:${this.command}`);
-    const packet = createPacket(initPayload);
+    const packet = createPacket(initPayload, shellProtect(CommandId.CMD_SHELL_INIT));
     this.socket?.write(packet);
 
     // Start timeout timer
@@ -159,7 +188,7 @@ export class HdcShell extends EventEmitter {
       Buffer.from(`${SHELL_DATA}:`),
       buffer,
     ]);
-    const packet = createPacket(payload);
+    const packet = createPacket(payload, shellProtect(CommandId.CMD_SHELL_DATA));
     this.socket.write(packet);
     return true;
   }
@@ -173,7 +202,7 @@ export class HdcShell extends EventEmitter {
     }
 
     const payload = Buffer.from(`${SHELL_SIGNAL}:${signal}`);
-    const packet = createPacket(payload);
+    const packet = createPacket(payload, shellProtect(CommandId.CMD_SHELL_DATA));
     this.socket.write(packet);
     return true;
   }
@@ -201,7 +230,7 @@ export class HdcShell extends EventEmitter {
     }
 
     const payload = Buffer.from(`shell:resize:${rows}:${cols}`);
-    const packet = createPacket(payload);
+    const packet = createPacket(payload, shellProtect(CommandId.CMD_SHELL_DATA));
     this.socket.write(packet);
     return true;
   }
@@ -220,7 +249,7 @@ export class HdcShell extends EventEmitter {
     if (this.socket) {
       // Send close command
       const payload = Buffer.from('shell:close');
-      const packet = createPacket(payload);
+      const packet = createPacket(payload, shellProtect(CommandId.CMD_SHELL_DATA));
       this.socket.write(packet);
     }
 
@@ -315,6 +344,191 @@ export class HdcShell extends EventEmitter {
   getStderr(): string {
     return this.stderr;
   }
+
+  /**
+   * Start interactive shell mode.
+   *
+   * Pipes process.stdin raw data to the shell channel and streams
+   * stdout/stderr back to process.stdout/process.stderr.
+   * Handles SIGINT (Ctrl+C) and SIGTERM signals.
+   */
+  startInteractive(): void {
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    const stderr = process.stderr;
+
+    // Track whether raw mode was set so we can restore it
+    let wasRaw = false;
+
+    // Pipe stdout/stderr from shell to process output
+    this.on('stdout', (data: Buffer) => {
+      stdout.write(data);
+    });
+
+    this.on('stderr', (data: Buffer) => {
+      stderr.write(data);
+    });
+
+    // Handle exit: restore stdin and clean up
+    const cleanup = () => {
+      if (wasRaw) {
+        try {
+          stdin.setRawMode(false);
+        } catch {
+          // stdin may already be destroyed
+        }
+      }
+      stdin.removeListener('data', onData);
+      stdin.pause();
+    };
+
+    this.on('exit', () => {
+      cleanup();
+    });
+
+    this.on('close', () => {
+      cleanup();
+    });
+
+    this.on('error', () => {
+      cleanup();
+    });
+
+    // Set stdin to raw mode for proper terminal handling
+    if (stdin.isTTY) {
+      stdin.setRawMode(true);
+      wasRaw = true;
+    }
+    stdin.resume();
+
+    // Pipe stdin data to shell
+    const onData = (data: Buffer) => {
+      // Check for Ctrl+C (0x03) in raw mode
+      if (wasRaw && data.length === 1 && data[0] === 0x03) {
+        this.sendSignal(ShellSignal.SIGINT);
+        return;
+      }
+      this.write(data);
+    };
+
+    stdin.on('data', onData);
+
+    // Handle SIGINT: send SIGINT to device shell
+    const onSigInt = () => {
+      this.sendSignal(ShellSignal.SIGINT);
+    };
+
+    // Handle SIGTERM: kill shell
+    const onSigTerm = () => {
+      this.kill();
+      cleanup();
+    };
+
+    process.on('SIGINT', onSigInt);
+    process.on('SIGTERM', onSigTerm);
+
+    // Remove signal handlers when shell closes
+    this.on('close', () => {
+      process.removeListener('SIGINT', onSigInt);
+      process.removeListener('SIGTERM', onSigTerm);
+    });
+
+    this.on('exit', () => {
+      process.removeListener('SIGINT', onSigInt);
+      process.removeListener('SIGTERM', onSigTerm);
+    });
+  }
+}
+
+// ============================================================================
+// Extended Shell TLV Encoding
+// ============================================================================
+
+/**
+ * Encode extended shell options as TLV string.
+ *
+ * Each TLV pair uses a 16-byte tag + 16-byte value format,
+ * as defined by TlvAppend in base.ts.
+ */
+export function encodeExtendedShellTlv(options: ExtendedShellOptions): string {
+  let tlv = '';
+
+  if (options.bundleName) {
+    tlv = TlvAppend(tlv, SHELL_OPT_BUNDLE_NAME, options.bundleName);
+  }
+  if (options.abilityType) {
+    tlv = TlvAppend(tlv, SHELL_OPT_ABILITY_TYPE, options.abilityType);
+  }
+  if (options.abilityName) {
+    tlv = TlvAppend(tlv, SHELL_OPT_ABILITY_NAME, options.abilityName);
+  }
+  if (options.command) {
+    tlv = TlvAppend(tlv, SHELL_OPT_COMMAND, options.command);
+  }
+
+  return tlv;
+}
+
+/**
+ * Decode TLV string back to extended shell options.
+ */
+export function decodeExtendedShellTlv(tlv: string): ExtendedShellOptions {
+  const map = TlvToStringMap(tlv);
+  return {
+    bundleName: map.get(SHELL_OPT_BUNDLE_NAME) || '',
+    abilityType: map.get(SHELL_OPT_ABILITY_TYPE) || undefined,
+    abilityName: map.get(SHELL_OPT_ABILITY_NAME) || undefined,
+    command: map.get(SHELL_OPT_COMMAND) || undefined,
+  };
+}
+
+/**
+ * Parse extended shell command-line arguments.
+ *
+ * Supports: -b <bundle> [-t <type>] [-e <ability>] [-c <cmd>]
+ */
+export function parseExtendedShellArgs(args: string[]): ExtendedShellOptions | null {
+  let bundleName = '';
+  let abilityType: string | undefined;
+  let abilityName: string | undefined;
+  let command: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '-b':
+        if (i + 1 < args.length) {
+          bundleName = args[++i];
+        }
+        break;
+      case '-t':
+        if (i + 1 < args.length) {
+          abilityType = args[++i];
+        }
+        break;
+      case '-e':
+        if (i + 1 < args.length) {
+          abilityName = args[++i];
+        }
+        break;
+      case '-c':
+        if (i + 1 < args.length) {
+          command = args[++i];
+        }
+        break;
+    }
+  }
+
+  // -b is required for extended shell
+  if (!bundleName) {
+    return null;
+  }
+
+  return {
+    bundleName,
+    abilityType,
+    abilityName,
+    command,
+  };
 }
 
 // ============================================================================

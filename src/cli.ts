@@ -4,20 +4,22 @@
  * HDC CLI Entry Point
  *
  * Command line interface for HDC (OpenHarmony Device Connector).
+ * Uses HdcClient with channel protocol, auto server pull-up, and full command support.
+ *
  * Ported from: hdc-source/src/host/main.cpp
  */
 
-import { parseCommand, ParsedCommand, getHelp } from './host/parser.js';
-import { TcpClient, TcpServer, TcpState } from './common/tcp.js';
-import { HdcSession, HdcSessionManager, ConnType } from './common/session.js';
-import { HdcShell, executeShell } from './host/shell.js';
-import { HdcFileSender, HdcFileReceiver, sendDirectory } from './host/file.js';
-import { createPacket, parsePacket } from './common/message.js';
-import { CommandId } from './common/protocol.js';
-import { GetRandomString } from './common/base.js';
+import * as net from 'net';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as child_process from 'child_process';
+import { parseCommand, ParsedCommand, getHelp, parseServerAddress, getDefaultServerAddress, buildCommandString } from './host/parser.js';
+import { HdcClient } from './host/client.js';
+import { HdcServer } from './host/server.js';
+import { HdcAuth } from './common/auth.js';
+import { DEFAULT_PORT } from './common/protocol.js';
 
-const VERSION = '1.0.0';
-const DEFAULT_PORT = 8710;
+const VERSION = '0.0.1';
 
 // ============================================================================
 // Main
@@ -25,7 +27,7 @@ const DEFAULT_PORT = 8710;
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  
+
   // No arguments - show help
   if (args.length === 0) {
     console.log(getHelp());
@@ -35,8 +37,7 @@ async function main(): Promise<void> {
   const parsed = parseCommand(args);
 
   if (parsed instanceof Error) {
-    console.error(`Error: ${parsed.message}`);
-    console.error('\n' + getHelp());
+    console.error(parsed.message);
     process.exit(1);
   }
 
@@ -58,7 +59,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Client mode - connect to server or device
+  // Handle keygen locally (does not need server)
+  if (parsed.command === 'keygen') {
+    await runKeygen(parsed.args);
+    return;
+  }
+
+  // Client mode - connect to server
   try {
     await runClient(parsed);
   } catch (err) {
@@ -72,57 +79,75 @@ async function main(): Promise<void> {
 // ============================================================================
 
 async function runServer(parsed: ParsedCommand): Promise<void> {
-  const port = parsed.serverAddr ? parseInt(parsed.serverAddr.split(':')[1] || '8710') : DEFAULT_PORT;
-  
-  const server = new TcpServer({ host: '0.0.0.0', port });
-  const sessionManager = new HdcSessionManager(true);
+  const addr = parsed.serverAddr || getDefaultServerAddress();
+  const { host, port } = parseServerAddress(addr);
 
-  server.on('listening', () => {
-    console.log(`HDC server listening on port ${port}`);
-    console.log('Press Ctrl+C to stop');
-  });
-
-  server.on('connection', (connection) => {
-    console.log(`Client connected: ${connection.remoteAddress}:${connection.remotePort}`);
-    
-    // Create session for this connection
-    const session = sessionManager.createSession(ConnType.CONN_TCP);
-    session.attachSocket(connection.socket);
-    
-    session.on('handshake', (handshake) => {
-      console.log(`Session ${session.sessionId} handshake complete`);
-    });
-
-    session.on('close', () => {
-      console.log(`Session ${session.sessionId} closed`);
-    });
-  });
-
-  server.on('error', (err: Error) => {
-    console.error(`Server error: ${err.message}`);
-  });
+  const server = new HdcServer({ host, port });
 
   try {
     await server.start();
-
-    // Handle shutdown signals
-    process.on('SIGINT', async () => {
-      console.log('\nShutting down...');
-      sessionManager.closeAll();
-      await server.stop();
-      process.exit(0);
-    });
-
-    process.on('SIGTERM', async () => {
-      sessionManager.closeAll();
-      await server.stop();
-      process.exit(0);
-    });
-
+    console.log(`HDC server listening on ${host}:${port}`);
+    console.log('Press Ctrl+C to stop');
   } catch (err) {
-    console.error('Failed to start server:', err);
+    console.error(`Failed to start server: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
   }
+
+  // Handle shutdown signals
+  const shutdown = async () => {
+    console.log('\nShutting down server...');
+    await server.stop();
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+// ============================================================================
+// Server Alive Check & Auto Pull-Up
+// ============================================================================
+
+/**
+ * Check if the HDC server is alive by attempting a TCP connection.
+ */
+async function checkServerAlive(host: string, port: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(1000);
+    socket.on('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on('error', () => {
+      resolve(false);
+    });
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.connect(port, host);
+  });
+}
+
+/**
+ * Spawn the HDC server process in the background.
+ */
+async function pullupServer(host: string, port: number): Promise<void> {
+  const serverArgs = ['-m', '-s', `${host}:${port}`];
+
+  const child = child_process.spawn(process.execPath, [
+    path.join(__dirname, 'cli.js'),
+    ...serverArgs,
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  });
+
+  child.unref();
+
+  // Wait briefly for server to start
+  await new Promise((r) => setTimeout(r, 500));
 }
 
 // ============================================================================
@@ -130,208 +155,83 @@ async function runServer(parsed: ParsedCommand): Promise<void> {
 // ============================================================================
 
 async function runClient(parsed: ParsedCommand): Promise<void> {
-  const host = parsed.serverAddr?.split(':')[0] || '127.0.0.1';
-  const port = parseInt(parsed.serverAddr?.split(':')[1] || '8710');
+  const addr = parsed.serverAddr || getDefaultServerAddress();
+  const { host, port } = parseServerAddress(addr);
 
-  const client = new TcpClient({ host, port, timeout: 5000 });
+  // Auto server pull-up
+  if (!parsed.spawnedServer && !parsed.skipPullup) {
+    const alive = await checkServerAlive(host, port);
+    if (!alive) {
+      await pullupServer(host, port);
+      // Verify server started
+      const retryAlive = await checkServerAlive(host, port);
+      if (!retryAlive) {
+        throw new Error('Failed to start HDC server. Try running "hdc start" manually.');
+      }
+    }
+  }
+
+  // Connect to server via HdcClient
+  const client = new HdcClient({
+    host,
+    port,
+    connectKey: parsed.targetKey,
+  });
+
+  await client.connect();
 
   try {
-    await client.connect();
-    
-    const result = await handleCommand(client, parsed);
-    if (result) {
-      console.log(result);
+    // Build command string from parsed result and send to server
+    const commandStr = buildCommandString(parsed);
+
+    if (commandStr && parsed.command) {
+      const response = await client.executeCommand(commandStr);
+      if (response) {
+        process.stdout.write(response);
+      }
+    } else {
+      console.log(getHelp());
     }
   } finally {
     await client.disconnect();
   }
 }
 
-/**
- * Handle client command
- */
-async function handleCommand(client: TcpClient, parsed: ParsedCommand): Promise<string | void> {
-  const { command, args } = parsed;
-
-  switch (command) {
-    case 'list':
-      return await handleList(client, args);
-    
-    case 'shell':
-      return await handleShell(client, args);
-    
-    case 'file':
-      return await handleFile(client, args);
-    
-    case 'send':
-      // Alias for file send
-      return await handleFile(client, ['send', ...args]);
-    
-    case 'recv':
-    case 'pull':
-      // Alias for file recv
-      return await handleFile(client, ['recv', ...args]);
-    
-    case 'install':
-      return await handleInstall(client, args);
-    
-    case 'uninstall':
-      return await handleUninstall(client, args);
-    
-    case 'fport':
-      return await handleForward(client, args);
-    
-    case 'kill':
-      return await handleKill(client);
-    
-    default:
-      return `Unknown command: ${command}\n${getHelp()}`;
-  }
-}
-
 // ============================================================================
-// Command Handlers
+// Keygen Command
 // ============================================================================
 
-async function handleList(client: TcpClient, args: string[]): Promise<string> {
-  const subCmd = args[0] || 'targets';
-  
-  if (subCmd === 'targets') {
-    // List connected devices
-    const request = createPacket(Buffer.from('list:targets'));
-    client.send(request);
-    
-    // For now, return mock data
-    return '127.0.0.1:5555\n(1 device)';
-  }
-  
-  return `Unknown list type: ${subCmd}`;
-}
-
-async function handleShell(client: TcpClient, args: string[]): Promise<string> {
-  const shellCmd = args.join(' ');
-  
-  if (!shellCmd) {
-    // Interactive shell mode
-    return 'Interactive shell mode not yet supported. Use: hdc shell <command>';
+async function runKeygen(args: string[]): Promise<void> {
+  const filePath = args[0];
+  if (!filePath) {
+    console.error('Usage: hdc keygen <FILE>');
+    process.exit(1);
   }
 
-  // One-shot shell command
+  const auth = new HdcAuth();
+
   try {
-    const request = createPacket(Buffer.from(`shell:${shellCmd}`));
-    client.send(request);
-    return 'Shell command sent';
+    const keyPair = await auth.generateKeyPair();
+
+    // Write private key to specified file
+    const dir = path.dirname(path.resolve(filePath));
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    fs.writeFileSync(filePath, keyPair.privateKey);
+
+    // Write public key to file with .pub suffix
+    const pubPath = filePath + '.pub';
+    fs.writeFileSync(pubPath, keyPair.publicKey);
+
+    console.log(`Generated RSA keypair:`);
+    console.log(`  Private key: ${path.resolve(filePath)}`);
+    console.log(`  Public key:  ${path.resolve(pubPath)}`);
   } catch (err) {
-    throw new Error(`Shell execution failed: ${err}`);
+    console.error(`Keygen failed: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
   }
-}
-
-async function handleFile(client: TcpClient, args: string[]): Promise<string> {
-  const subCmd = args[0];
-  
-  switch (subCmd) {
-    case 'send':
-      const localPath = args[1];
-      const remotePath = args[2];
-      if (!localPath || !remotePath) {
-        return 'Usage: hdc file send <local> <remote>';
-      }
-      try {
-        const request = createPacket(Buffer.from(`file:send:${remotePath}`));
-        client.send(request);
-        return `Sending ${localPath} to ${remotePath}`;
-      } catch (err) {
-        throw new Error(`Send failed: ${err}`);
-      }
-
-    case 'recv':
-    case 'pull':
-      const recvRemote = args[1];
-      const recvLocal = args[2];
-      if (!recvRemote || !recvLocal) {
-        return 'Usage: hdc file recv <remote> <local>';
-      }
-      try {
-        const request = createPacket(Buffer.from(`file:recv:${recvRemote}`));
-        client.send(request);
-        return `Receiving ${recvRemote} to ${recvLocal}`;
-      } catch (err) {
-        throw new Error(`Receive failed: ${err}`);
-      }
-
-    default:
-      return 'Usage: hdc file <send|recv> ...';
-  }
-}
-
-async function handleInstall(client: TcpClient, args: string[]): Promise<string> {
-  const packagePath = args[0];
-  if (!packagePath) {
-    return 'Usage: hdc install <package>';
-  }
-  
-  try {
-    const request = createPacket(Buffer.from(`install:${packagePath}`));
-    client.send(request);
-    return `Installing ${packagePath}`;
-  } catch (err) {
-    throw new Error(`Install failed: ${err}`);
-  }
-}
-
-async function handleUninstall(client: TcpClient, args: string[]): Promise<string> {
-  const packageName = args[0];
-  if (!packageName) {
-    return 'Usage: hdc uninstall <package>';
-  }
-  
-  try {
-    const request = createPacket(Buffer.from(`uninstall:${packageName}`));
-    client.send(request);
-    return `Uninstalling ${packageName}`;
-  } catch (err) {
-    throw new Error(`Uninstall failed: ${err}`);
-  }
-}
-
-async function handleForward(client: TcpClient, args: string[]): Promise<string> {
-  const subCmd = args[0];
-  
-  switch (subCmd) {
-    case 'list':
-      const listRequest = createPacket(Buffer.from('fport:list'));
-      client.send(listRequest);
-      return 'Port forwards:';
-    
-    case 'add':
-      const localPort = args[1];
-      const remotePort = args[2];
-      if (!localPort || !remotePort) {
-        return 'Usage: hdc fport add <local> <remote>';
-      }
-      const addRequest = createPacket(Buffer.from(`fport:add:${localPort}:${remotePort}`));
-      client.send(addRequest);
-      return `Forwarding ${localPort} -> ${remotePort}`;
-    
-    case 'rm':
-    case 'remove':
-      const rmPort = args[1];
-      if (!rmPort) {
-        return 'Usage: hdc fport rm <port>';
-      }
-      const rmRequest = createPacket(Buffer.from(`fport:rm:${rmPort}`));
-      client.send(rmRequest);
-      return `Removed forward ${rmPort}`;
-    
-    default:
-      return 'Usage: hdc fport <list|add|rm> ...';
-  }
-}
-
-async function handleKill(client: TcpClient): Promise<string> {
-  const request = createPacket(Buffer.from('kill'));
-  client.send(request);
-  return 'Server killed';
 }
 
 // ============================================================================

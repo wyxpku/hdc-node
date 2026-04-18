@@ -2,6 +2,7 @@
  * HDC Forward Module
  *
  * Provides port forwarding functionality (TCP port forwarding).
+ * Supports all 7 forward node types and reverse forwarding.
  * Ported from: hdc-source/src/common/forward.cpp
  */
 
@@ -19,7 +20,10 @@ export const DEFAULT_BUFFER_SIZE = 64 * 1024;
 export enum ForwardType {
   TCP = 'tcp',
   JDWP = 'jdwp',
-  ABSTRACT = 'abstract',
+  ARK = 'ark',
+  ABSTRACT = 'localabstract',
+  FILESYSTEM = 'localfilesystem',
+  DEV = 'dev',
   RESERVED = 'reserved',
 }
 
@@ -30,6 +34,72 @@ export enum ForwardState {
   FORAWRDING = 'forwarding',
   CLOSED = 'closed',
   ERROR = 'error',
+}
+
+// ============================================================================
+// Forward Node Types
+// ============================================================================
+
+export interface ForwardNode {
+  type: ForwardType;
+  value: string; // port number, socket name, pid, etc.
+}
+
+/**
+ * Mapping from string prefix to ForwardType.
+ * Order matters: longer prefixes must come first to avoid partial matches.
+ */
+const FORWARD_TYPE_PREFIXES: [string, ForwardType][] = [
+  ['localabstract:', ForwardType.ABSTRACT],
+  ['localfilesystem:', ForwardType.FILESYSTEM],
+  ['tcp:', ForwardType.TCP],
+  ['jdwp:', ForwardType.JDWP],
+  ['ark:', ForwardType.ARK],
+  ['dev:', ForwardType.DEV],
+  ['reserved:', ForwardType.RESERVED],
+];
+
+/**
+ * Parse a forward node spec string into a ForwardNode.
+ *
+ * Supported specs:
+ *   "tcp:8080"                     -> { type: TCP, value: "8080" }
+ *   "localabstract:mysocket"       -> { type: ABSTRACT, value: "mysocket" }
+ *   "jdwp:1234"                    -> { type: JDWP, value: "1234" }
+ *   "ark:1234@5678@Debugger"       -> { type: ARK, value: "1234@5678@Debugger" }
+ *   "dev:/dev/ttyUSB0"             -> { type: DEV, value: "/dev/ttyUSB0" }
+ *   "localfilesystem:/tmp/sock"    -> { type: FILESYSTEM, value: "/tmp/sock" }
+ *   "reserved: anything"           -> { type: RESERVED, value: " anything" }
+ */
+export function parseForwardNode(spec: string): ForwardNode | null {
+  if (!spec || typeof spec !== 'string') {
+    return null;
+  }
+
+  const trimmed = spec.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  for (const [prefix, type] of FORWARD_TYPE_PREFIXES) {
+    if (trimmed.startsWith(prefix)) {
+      const value = trimmed.substring(prefix.length);
+      if (value.length === 0) {
+        return null;
+      }
+      return { type, value };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Format a ForwardNode back into its string specification.
+ * e.g. { type: ForwardType.TCP, value: "8080" } -> "tcp:8080"
+ */
+export function formatForwardNode(node: ForwardNode): string {
+  return `${node.type}:${node.value}`;
 }
 
 // ============================================================================
@@ -266,6 +336,117 @@ export class HdcForward extends EventEmitter {
 }
 
 // ============================================================================
+// HdcReverseForward - Reverse Port Forwarding
+// ============================================================================
+
+export class HdcReverseForward extends EventEmitter {
+  private id: string;
+  private localNode: ForwardNode;
+  private remoteNode: ForwardNode;
+  private state: ForwardState = ForwardState.IDLE;
+  private bytesForwarded: number = 0;
+  private connections: number = 0;
+  private startTime: number = 0;
+
+  constructor(localNode: ForwardNode, remoteNode: ForwardNode) {
+    super();
+    this.id = GetRandomString(8);
+    this.localNode = localNode;
+    this.remoteNode = remoteNode;
+  }
+
+  /**
+   * Get reverse forward ID
+   */
+  getId(): string {
+    return this.id;
+  }
+
+  /**
+   * Get current state
+   */
+  getState(): ForwardState {
+    return this.state;
+  }
+
+  /**
+   * Get local node
+   */
+  getLocalNode(): ForwardNode {
+    return this.localNode;
+  }
+
+  /**
+   * Get remote node
+   */
+  getRemoteNode(): ForwardNode {
+    return this.remoteNode;
+  }
+
+  /**
+   * Get bytes forwarded
+   */
+  getBytesForwarded(): number {
+    return this.bytesForwarded;
+  }
+
+  /**
+   * Get active connections
+   */
+  getConnections(): number {
+    return this.connections;
+  }
+
+  /**
+   * Get the task string representation for this reverse forward.
+   * Format: "rport <remote> <local>"
+   */
+  getTaskStr(): string {
+    return `rport ${formatForwardNode(this.remoteNode)} ${formatForwardNode(this.localNode)}`;
+  }
+
+  /**
+   * Start reverse forwarding.
+   * In reverse forward: device connects to remote, host listens on local.
+   * The actual data-plane is handled by the daemon on the device side;
+   * the host side tracks state and handles local connections.
+   */
+  async start(): Promise<void> {
+    if (this.state !== ForwardState.IDLE) {
+      throw new Error('Reverse forward already started');
+    }
+
+    this.state = ForwardState.LISTENING;
+    this.startTime = Date.now();
+
+    // For reverse forwarding, the device initiates the connection.
+    // The host registers interest and the daemon on the device side
+    // listens and connects back. We mark state as forwarding.
+    this.state = ForwardState.FORAWRDING;
+    this.emit('listening');
+  }
+
+  /**
+   * Stop reverse forwarding
+   */
+  async stop(): Promise<void> {
+    if (this.state === ForwardState.CLOSED) {
+      return;
+    }
+
+    this.state = ForwardState.CLOSED;
+    this.emit('close');
+  }
+
+  /**
+   * Check if reverse forwarding is active
+   */
+  isActive(): boolean {
+    return this.state === ForwardState.FORAWRDING;
+  }
+}
+
+// ============================================================================
 // HdcForwardManager - Manage multiple forwards
 // ============================================================================
 
@@ -277,7 +458,7 @@ export class HdcForwardManager extends EventEmitter {
    */
   async createForward(options: ForwardOptions): Promise<HdcForward> {
     const forward = new HdcForward(options);
-    
+
     forward.on('listening', (port: number) => {
       this.emit('forward-start', forward, port);
     });
@@ -293,7 +474,7 @@ export class HdcForwardManager extends EventEmitter {
 
     await forward.start();
     this.forwards.set(forward.getId(), forward);
-    
+
     return forward;
   }
 

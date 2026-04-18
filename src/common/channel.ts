@@ -16,6 +16,10 @@ import { GetRandomU32 } from './base.js';
 export const MAX_CHANNEL_COUNT = 1024;
 export const CHANNEL_BUF_SIZE = 64 * 1024;
 
+// ChannelHandShake constants
+export const BANNER_FEATURE_TAG_OFFSET = 11;
+export const HUGE_BUF_TAG = 0x48; // 'H' - indicates 512KB buffer support
+
 export enum ChannelState {
   IDLE = 'idle',
   INITIALIZING = 'initializing',
@@ -46,6 +50,81 @@ export interface ChannelInfo {
   bytesSent: number;
   createTime: number;
   lastActivity: number;
+}
+
+// ============================================================================
+// ChannelHandShake - Raw struct encoding/decoding
+// ============================================================================
+
+export interface ChannelHandShake {
+  banner: string;
+  channelId: number;
+  connectKey: string;
+  version: string;
+}
+
+/**
+ * Encode a ChannelHandShake struct into a packed binary buffer.
+ * Short form: 44 bytes (banner + union). Long form: 108 bytes (banner + union + version).
+ */
+export function encodeChannelHandShake(
+  hs: ChannelHandShake,
+  longForm: boolean,
+  hugeBuffer: boolean = true,
+): Buffer {
+  const size = longForm ? 108 : 44;
+  const buf = Buffer.alloc(size, 0);
+
+  // Write banner into first 11 bytes as ASCII, padded with 0x00
+  const bannerBytes = Buffer.from(hs.banner, 'ascii');
+  const bannerLen = Math.min(bannerBytes.length, 11);
+  bannerBytes.copy(buf, 0, 0, bannerLen);
+  // Remaining banner bytes are already 0 from alloc
+
+  // Feature tag at offset 11
+  if (hugeBuffer) {
+    buf[BANNER_FEATURE_TAG_OFFSET] = HUGE_BUF_TAG;
+  }
+
+  // Union field at offset 12 (32 bytes)
+  if (hs.connectKey.length > 0) {
+    const keyBytes = Buffer.from(hs.connectKey, 'ascii');
+    const keyLen = Math.min(keyBytes.length, 32);
+    keyBytes.copy(buf, 12, 0, keyLen);
+  } else {
+    buf.writeUInt32BE(hs.channelId, 12);
+  }
+
+  // Version at offset 44 (64 bytes), only in long form
+  if (longForm && hs.version.length > 0) {
+    const verBytes = Buffer.from(hs.version, 'ascii');
+    const verLen = Math.min(verBytes.length, 64);
+    verBytes.copy(buf, 44, 0, verLen);
+  }
+
+  return buf;
+}
+
+/**
+ * Decode a packed binary buffer into a ChannelHandShake struct.
+ */
+export function decodeChannelHandShake(buf: Buffer): ChannelHandShake {
+  // Read banner from bytes 0-10 as ASCII, strip trailing nulls
+  const banner = buf.subarray(0, 11).toString('ascii').replace(/\0+$/, '');
+
+  // Read connectKey from bytes 12-43 as ASCII, strip trailing nulls
+  const connectKey = buf.subarray(12, 44).toString('ascii').replace(/\0+$/, '');
+
+  // Read channelId as uint32 BE at offset 12
+  const channelId = buf.readUInt32BE(12);
+
+  // Read version from bytes 44-107 if long form (buffer >= 108 bytes)
+  let version = '';
+  if (buf.length >= 108) {
+    version = buf.subarray(44, 108).toString('ascii').replace(/\0+$/, '');
+  }
+
+  return { banner, channelId, connectKey, version };
 }
 
 // ============================================================================

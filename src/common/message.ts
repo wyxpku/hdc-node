@@ -1,30 +1,38 @@
 /**
  * HDC Message/Packet Module
  *
- * Handles protocol packet encoding and decoding.
- * Translated from: src/common/session.h (PayloadHead structure)
+ * Handles protocol packet encoding and decoding using the official
+ * 11-byte PayloadHead + protobuf PayloadProtect wire format.
+ *
+ * PayloadHead (11 bytes, big-endian for multi-byte fields):
+ *   Offset  Size  Field
+ *   0       2     flag: "HW" (0x48, 0x57)
+ *   2       2     reserve: uint16 BE (encrypt flags, usually 0)
+ *   4       1     protocolVer: 0x01
+ *   5       2     headSize: uint16 BE (size of serialized PayloadProtect)
+ *   7       4     dataSize: uint32 BE (size of raw payload data)
  */
 
-import { PACKET_FLAG, HDC_VERSION_NUMBER } from './protocol.js';
+import { PACKET_FLAG } from './protocol.js';
+import { PayloadProtect, encodePayloadProtect, decodePayloadProtect } from './serialization.js';
 
-// Packet header size (10 bytes total)
-// flag[2] + reserve[2] + version[1] + option[1] + dataLength[4] = 10 bytes
-export const PACKET_HEADER_SIZE = 10;
+// Protocol constants
+export const PROTOCOL_VERSION = 0x01;
+export const PAYLOAD_PROTECT_VCODE = 0x09;
+
+// Packet header size (11 bytes total)
+export const PACKET_HEADER_SIZE = 11;
 
 /**
- * PayloadHead structure (matches C++ struct)
- * - flag[2]: "HW"
- * - reserve[2]: reserved bytes
- * - version: 1 byte: protocol version
- * - option: 1 byte: options
- * - dataLength: 4 bytes: payload length
+ * PayloadHead structure (11 bytes)
+ * Matches the official HDC wire format.
  */
 export interface PacketHeader {
-  flag: string;       // 2 bytes: "HW"
-  reserve: number;   // 2 bytes: reserved
-  version: number;   // 1 byte: protocol version
-  option: number;    // 1 byte: options
-  dataLength: number; // 4 bytes: payload length
+  flag: string;        // 2 bytes: "HW"
+  reserve: number;     // 2 bytes: uint16 BE (encrypt flags)
+  protocolVer: number; // 1 byte: protocol version (0x01)
+  headSize: number;    // 2 bytes: uint16 BE (size of serialized PayloadProtect)
+  dataSize: number;    // 4 bytes: uint32 BE (size of raw payload data)
 }
 
 /**
@@ -33,32 +41,41 @@ export interface PacketHeader {
 export const DEFAULT_HEADER: PacketHeader = {
   flag: PACKET_FLAG,
   reserve: 0,
-  version: 1,
-  option: 0,
-  dataLength: 0,
+  protocolVer: PROTOCOL_VERSION,
+  headSize: 0,
+  dataSize: 0,
 };
 
 /**
- * Encode a packet header into a Buffer
+ * Result of parsing a packet
+ */
+export interface PacketParseResult {
+  header: PacketHeader;
+  protect: PayloadProtect;
+  payload: Buffer;
+}
+
+/**
+ * Encode a packet header into a Buffer (11 bytes)
  */
 export function encodeHeader(header: PacketHeader): Buffer {
   const buf = Buffer.allocUnsafe(PACKET_HEADER_SIZE);
-  
-  // flag (2 bytes)
+
+  // flag (2 bytes) - ASCII
   buf.write(header.flag, 0, 2, 'ascii');
-  
-  // reserve (2 bytes) - little endian
-  buf.writeUInt16LE(header.reserve, 2);
-  
-  // version (1 byte)
-  buf.writeUInt8(header.version, 4);
-  
-  // option (1 byte)
-  buf.writeUInt8(header.option, 5);
-  
-  // dataLength (4 bytes) - little endian
-  buf.writeUInt32LE(header.dataLength, 6);
-  
+
+  // reserve (2 bytes) - big-endian
+  buf.writeUInt16BE(header.reserve, 2);
+
+  // protocolVer (1 byte)
+  buf.writeUInt8(header.protocolVer, 4);
+
+  // headSize (2 bytes) - big-endian
+  buf.writeUInt16BE(header.headSize, 5);
+
+  // dataSize (4 bytes) - big-endian
+  buf.writeUInt32BE(header.dataSize, 7);
+
   return buf;
 }
 
@@ -69,48 +86,76 @@ export function decodeHeader(buf: Buffer): PacketHeader | null {
   if (buf.length < PACKET_HEADER_SIZE) {
     return null;
   }
-  
+
   return {
     flag: buf.toString('ascii', 0, 2),
-    reserve: buf.readUInt16LE(2),
-    version: buf.readUInt8(4),
-    option: buf.readUInt8(5),
-    dataLength: buf.readUInt32LE(6),
+    reserve: buf.readUInt16BE(2),
+    protocolVer: buf.readUInt8(4),
+    headSize: buf.readUInt16BE(5),
+    dataSize: buf.readUInt32BE(7),
   };
 }
 
 /**
- * Create a complete packet with header and payload
+ * Create a complete packet with header, serialized PayloadProtect, and payload data.
+ *
+ * Wire format: [PayloadHead 11 bytes][PayloadProtect bytes][payload data bytes]
  */
-export function createPacket(payload: Buffer, option: number = 0): Buffer {
+export function createPacket(payload: Buffer, protect: PayloadProtect): Buffer {
+  const protectBuf = encodePayloadProtect(protect);
+
   const header: PacketHeader = {
     flag: PACKET_FLAG,
     reserve: 0,
-    version: 1,
-    option,
-    dataLength: payload.length,
+    protocolVer: PROTOCOL_VERSION,
+    headSize: protectBuf.length,
+    dataSize: payload.length,
   };
-  
-  return Buffer.concat([encodeHeader(header), payload]);
+
+  return Buffer.concat([encodeHeader(header), protectBuf, payload]);
 }
 
 /**
- * Parse a packet buffer into header and payload
+ * Parse a packet buffer into header, decoded PayloadProtect, and payload data.
+ *
+ * Returns null if the buffer is too small, the flag is wrong, or vCode is invalid.
  */
-export function parsePacket(buf: Buffer): { header: PacketHeader; payload: Buffer } | null {
+export function parsePacket(buf: Buffer): PacketParseResult | null {
   const header = decodeHeader(buf);
   if (!header) {
     return null;
   }
-  
-  const payload = buf.subarray(PACKET_HEADER_SIZE);
-  
-  if (payload.length !== header.dataLength) {
-    // Length mismatch - could be partial packet
+
+  // Validate flag
+  if (header.flag !== PACKET_FLAG) {
     return null;
   }
-  
-  return { header, payload };
+
+  // Check we have enough bytes for header + protect + payload
+  const expectedSize = PACKET_HEADER_SIZE + header.headSize + header.dataSize;
+  if (buf.length < expectedSize) {
+    return null;
+  }
+
+  // Decode PayloadProtect
+  const protectStart = PACKET_HEADER_SIZE;
+  const protectEnd = protectStart + header.headSize;
+  let protect: PayloadProtect;
+  try {
+    protect = decodePayloadProtect(buf.subarray(protectStart, protectEnd));
+  } catch {
+    return null;
+  }
+
+  // Validate vCode
+  if (protect.vCode !== PAYLOAD_PROTECT_VCODE) {
+    return null;
+  }
+
+  // Extract payload
+  const payload = buf.subarray(protectEnd, protectEnd + header.dataSize);
+
+  return { header, protect, payload };
 }
 
 /**
@@ -118,15 +163,15 @@ export function parsePacket(buf: Buffer): { header: PacketHeader; payload: Buffe
  */
 export function isValidHeader(header: PacketHeader): boolean {
   return header.flag === PACKET_FLAG &&
-         header.version >= 1 &&
-         header.dataLength >= 0;
+         header.protocolVer >= 1 &&
+         header.dataSize >= 0;
 }
 
 /**
- * Calculate total packet size (header + payload)
+ * Calculate total packet size (header + protect + payload)
  */
-export function getPacketSize(dataLength: number): number {
-  return PACKET_HEADER_SIZE + dataLength;
+export function getPacketSize(headSize: number, dataSize: number): number {
+  return PACKET_HEADER_SIZE + headSize + dataSize;
 }
 
 /**
@@ -157,15 +202,15 @@ export function decodeCtrlMessage(buf: Buffer): CtrlMessage | null {
   if (buf.length < 9) {
     return null;
   }
-  
+
   const command = buf.readUInt8(0);
   const channelId = buf.readUInt32LE(1);
   const dataLen = buf.readUInt32LE(5);
-  
+
   if (buf.length < 9 + dataLen) {
     return null;
   }
-  
+
   return {
     command,
     channelId,
@@ -174,12 +219,7 @@ export function decodeCtrlMessage(buf: Buffer): CtrlMessage | null {
 }
 
 /**
- * Result of parsing a packet
- */
-export type PacketParseResult = { header: PacketHeader; payload: Buffer };
-
-/**
- * Session handshake message
+ * Session handshake message (text-based)
  */
 export interface HandshakeMessage {
   banner: string;       // "OHOS HDC"
@@ -210,11 +250,11 @@ export function decodeHandshake(buf: Buffer): HandshakeMessage | null {
   try {
     const str = buf.toString('utf-8');
     const parts = str.split('|');
-    
+
     if (parts.length < 5) {
       return null;
     }
-    
+
     return {
       banner: parts[0],
       authType: parseInt(parts[1], 10),
@@ -252,7 +292,7 @@ export function decodeHeartbeat(buf: Buffer): HeartbeatMessage | null {
   if (buf.length < 16) {
     return null;
   }
-  
+
   return {
     count: Number(buf.readBigUInt64LE(1)),
     timestamp: Number(buf.readBigUInt64LE(9)),

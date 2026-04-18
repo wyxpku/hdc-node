@@ -3,7 +3,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { HdcChannel, HdcChannelManager, ChannelState, MAX_CHANNEL_COUNT } from './channel.js';
+import { HdcChannel, HdcChannelManager, ChannelState, MAX_CHANNEL_COUNT,
+  encodeChannelHandShake, decodeChannelHandShake,
+  BANNER_FEATURE_TAG_OFFSET, HUGE_BUF_TAG } from './channel.js';
 
 describe('HdcChannel', () => {
   describe('constructor', () => {
@@ -379,5 +381,183 @@ describe('ChannelState enum', () => {
 describe('Constants', () => {
   it('should have correct max channel count', () => {
     expect(MAX_CHANNEL_COUNT).toBe(1024);
+  });
+});
+
+describe('ChannelHandShake', () => {
+  describe('encode short form', () => {
+    it('should produce a 44-byte buffer', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: '' },
+        false,
+      );
+      expect(buf.length).toBe(44);
+    });
+
+    it('should write banner into first 11 bytes padded with nulls', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: '' },
+        false,
+      );
+      // Banner "OHOS HDC" is 8 chars, padded to 11 with nulls
+      expect(buf.subarray(0, 11).toString('ascii')).toBe('OHOS HDC\0\0\0');
+    });
+  });
+
+  describe('encode with channelId', () => {
+    it('should write channelId as uint32 BE at offset 12', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0x12345678, connectKey: '', version: '' },
+        false,
+      );
+      expect(buf.readUInt32BE(12)).toBe(0x12345678);
+    });
+
+    it('should encode channelId in network byte order', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 1, connectKey: '', version: '' },
+        false,
+      );
+      // channelId=1 should be 00 00 00 01 in big-endian
+      expect(buf[12]).toBe(0);
+      expect(buf[13]).toBe(0);
+      expect(buf[14]).toBe(0);
+      expect(buf[15]).toBe(1);
+    });
+  });
+
+  describe('encode with connectKey', () => {
+    it('should write connectKey at offset 12 instead of channelId', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: 'devicekey123', version: '' },
+        false,
+      );
+      const key = buf.subarray(12, 44).toString('ascii').replace(/\0+$/, '');
+      expect(key).toBe('devicekey123');
+    });
+
+    it('should truncate connectKey to 32 bytes', () => {
+      const longKey = 'A'.repeat(64);
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: longKey, version: '' },
+        false,
+      );
+      const key = buf.subarray(12, 44).toString('ascii').replace(/\0+$/, '');
+      expect(key.length).toBe(32);
+      expect(key).toBe('A'.repeat(32));
+    });
+  });
+
+  describe('decode server handshake with channelId', () => {
+    it('should decode channelId from server handshake', () => {
+      // Simulate a server-sent handshake with channelId
+      const buf = Buffer.alloc(44, 0);
+      Buffer.from('OHOS HDC', 'ascii').copy(buf, 0);
+      buf.writeUInt32BE(0xAABBCCDD, 12);
+      const hs = decodeChannelHandShake(buf);
+      expect(hs.channelId).toBe(0xAABBCCDD);
+      expect(hs.banner).toBe('OHOS HDC');
+      // connectKey is the raw ASCII of bytes 12-43, which includes the channelId bytes
+      expect(hs.connectKey.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('huge buffer feature tag', () => {
+    it('should set feature tag byte to H by default', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: '' },
+        false,
+      );
+      expect(buf[BANNER_FEATURE_TAG_OFFSET]).toBe(0x48); // 'H'
+    });
+
+    it('should not set feature tag when hugeBuffer is false', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: '' },
+        false,
+        false,
+      );
+      expect(buf[BANNER_FEATURE_TAG_OFFSET]).toBe(0x00);
+    });
+
+    it('should expose HUGE_BUF_TAG constant', () => {
+      expect(HUGE_BUF_TAG).toBe(0x48);
+    });
+
+    it('should expose BANNER_FEATURE_TAG_OFFSET constant', () => {
+      expect(BANNER_FEATURE_TAG_OFFSET).toBe(11);
+    });
+  });
+
+  describe('long form with version', () => {
+    it('should produce a 108-byte buffer', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: '1.0.0' },
+        true,
+      );
+      expect(buf.length).toBe(108);
+    });
+
+    it('should write version at offset 44', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: 'Ver 1.2.3' },
+        true,
+      );
+      expect(buf.subarray(44, 108).toString('ascii').replace(/\0+$/, '')).toBe('Ver 1.2.3');
+    });
+
+    it('should decode version from long form buffer', () => {
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 42, connectKey: '', version: '2.0.0-beta' },
+        true,
+      );
+      const hs = decodeChannelHandShake(buf);
+      expect(hs.version).toBe('2.0.0-beta');
+    });
+
+    it('should truncate version to 64 bytes', () => {
+      const longVersion = 'x'.repeat(100);
+      const buf = encodeChannelHandShake(
+        { banner: 'OHOS HDC', channelId: 0, connectKey: '', version: longVersion },
+        true,
+      );
+      const ver = buf.subarray(44, 108).toString('ascii').replace(/\0+$/, '');
+      expect(ver.length).toBe(64);
+    });
+  });
+
+  describe('round-trip encoding', () => {
+    it('should round-trip short form with channelId', () => {
+      const original = { banner: 'OHOS HDC', channelId: 999, connectKey: '', version: '' };
+      const buf = encodeChannelHandShake(original, false);
+      const decoded = decodeChannelHandShake(buf);
+      expect(decoded.banner).toBe(original.banner);
+      expect(decoded.channelId).toBe(original.channelId);
+    });
+
+    it('should round-trip short form with connectKey', () => {
+      const original = { banner: 'OHOS HDC', channelId: 0, connectKey: 'my-device-key', version: '' };
+      const buf = encodeChannelHandShake(original, false);
+      const decoded = decodeChannelHandShake(buf);
+      expect(decoded.banner).toBe(original.banner);
+      expect(decoded.connectKey).toBe(original.connectKey);
+    });
+
+    it('should round-trip long form with all fields', () => {
+      const original = { banner: 'OHOS HDC', channelId: 42, connectKey: '', version: '3.1.0' };
+      const buf = encodeChannelHandShake(original, true);
+      const decoded = decodeChannelHandShake(buf);
+      expect(decoded.banner).toBe(original.banner);
+      expect(decoded.channelId).toBe(original.channelId);
+      expect(decoded.version).toBe(original.version);
+    });
+
+    it('should round-trip with connectKey and version', () => {
+      const original = { banner: 'OHOS HDC', channelId: 0, connectKey: 'abc123', version: '1.0.0' };
+      const buf = encodeChannelHandShake(original, true);
+      const decoded = decodeChannelHandShake(buf);
+      expect(decoded.connectKey).toBe('abc123');
+      expect(decoded.version).toBe('1.0.0');
+    });
   });
 });

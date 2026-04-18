@@ -7,8 +7,10 @@
 
 import { EventEmitter } from 'events';
 import * as net from 'net';
-import { createPacket, parsePacket } from '../common/message.js';
+import { createPacket, parsePacket, PAYLOAD_PROTECT_VCODE } from '../common/message.js';
+import { CommandId } from '../common/protocol.js';
 import { GetRandomString } from '../common/base.js';
+import { PayloadProtect } from '../common/serialization.js';
 
 // ============================================================================
 // Constants
@@ -65,6 +67,19 @@ export interface HilogStats {
   usedSize: number;
   oldestTime: string;
   newestTime: string;
+}
+
+// ============================================================================
+// Helper
+// ============================================================================
+
+function hilogProtect(commandFlag: number = 0): PayloadProtect {
+  return {
+    channelId: 0,
+    commandFlag,
+    checkSum: 0,
+    vCode: PAYLOAD_PROTECT_VCODE,
+  };
 }
 
 // ============================================================================
@@ -145,7 +160,7 @@ export class HdcHilog extends EventEmitter {
     }
 
     const command = parts.join(' ');
-    const request = createPacket(Buffer.from(command));
+    const request = createPacket(Buffer.from(command), hilogProtect(CommandId.CMD_UNITY_HILOG));
     this.socket.write(request);
 
     // Setup data handler
@@ -165,7 +180,7 @@ export class HdcHilog extends EventEmitter {
 
     this.state = HilogState.STOPPING;
 
-    const request = createPacket(Buffer.from(HILOG_STOP));
+    const request = createPacket(Buffer.from(HILOG_STOP), hilogProtect(CommandId.CMD_UNITY_HILOG));
     this.socket.write(request);
 
     this.socket.off('data', this.handleData.bind(this));
@@ -178,7 +193,7 @@ export class HdcHilog extends EventEmitter {
    * Clear logs
    */
   async clear(): Promise<void> {
-    const request = createPacket(Buffer.from(HILOG_CLEAR));
+    const request = createPacket(Buffer.from(HILOG_CLEAR), hilogProtect(CommandId.CMD_UNITY_HILOG));
     this.socket.write(request);
     this.emit('clear');
   }
@@ -188,7 +203,7 @@ export class HdcHilog extends EventEmitter {
    */
   async getStats(): Promise<HilogStats> {
     return new Promise((resolve, reject) => {
-      const request = createPacket(Buffer.from(HILOG_STATS));
+      const request = createPacket(Buffer.from(HILOG_STATS), hilogProtect(CommandId.CMD_UNITY_HILOG));
       this.socket.write(request);
 
       const handler = (data: Buffer) => {

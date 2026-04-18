@@ -6,7 +6,7 @@
  */
 
 // Protocol version
-export const HDC_VERSION_NUMBER = 0x30200100; // 3.2.0
+export const HDC_VERSION_NUMBER = 0x30200300; // 3.2.0d
 export const HDC_VERSION_STRING = '3.2.0';
 
 // Default ports
@@ -58,12 +58,12 @@ export enum AuthVerifyType {
   UNKNOWN = 100,
 }
 
-// Command IDs - matching HdcCommand enum
+// Command IDs - matching HdcCommand enum from define_enum.h
 export enum CommandId {
   // Kernel commands
-  CMD_KERNEL_HELP = 1,
-  CMD_KERNEL_HANDSHAKE = 2,
-  CMD_KERNEL_CHANNEL_CLOSE = 3,
+  CMD_KERNEL_HELP = 0,
+  CMD_KERNEL_HANDSHAKE = 1,
+  CMD_KERNEL_CHANNEL_CLOSE = 2,
   CMD_KERNEL_TARGET_DISCOVER = 4,
   CMD_KERNEL_TARGET_LIST = 5,
   CMD_KERNEL_TARGET_ANY = 6,
@@ -87,13 +87,13 @@ export enum CommandId {
   CMD_UNITY_REBOOT = 1003,
   CMD_UNITY_RUNMODE = 1004,
   CMD_UNITY_HILOG = 1005,
-  CMD_UNITY_ROOTRUN = 1006,
-  CMD_UNITY_BUGREPORT_INIT = 1008,
-  CMD_UNITY_BUGREPORT_DATA = 1009,
-
-  // JDWP commands
-  CMD_JDWP_LIST = 1100,
-  CMD_JDWP_TRACK = 1101,
+  CMD_UNITY_ROOTRUN = 1007,
+  CMD_JDWP_LIST = 1008,
+  CMD_JDWP_TRACK = 1009,
+  CMD_UNITY_COMMAND_TAIL = 1010,
+  CMD_UNITY_BUGREPORT_INIT = 1011,
+  CMD_UNITY_BUGREPORT_DATA = 1012,
+  CMD_UNITY_EXECUTE_EX = 1200,
 
   // Shell commands
   CMD_SHELL_INIT = 2000,
@@ -199,7 +199,7 @@ export const PKG_PAYLOAD_MAX_SIZE = MAX_SIZE_IOBUF;
  * Check if a command ID is valid
  */
 export function isValidCommandId(cmdId: number): boolean {
-  return cmdId > 0 && cmdId < 10000;
+  return cmdId >= 0 && cmdId < 10000;
 }
 
  /**

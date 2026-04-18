@@ -3,7 +3,190 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { HdcForward, HdcForwardManager, ForwardType, ForwardState, createTcpForward } from './forward.js';
+import {
+  HdcForward,
+  HdcForwardManager,
+  HdcReverseForward,
+  ForwardType,
+  ForwardState,
+  ForwardNode,
+  parseForwardNode,
+  formatForwardNode,
+  createTcpForward,
+} from './forward.js';
+
+// ============================================================================
+// parseForwardNode / formatForwardNode
+// ============================================================================
+
+describe('parseForwardNode', () => {
+  it('should parse tcp node', () => {
+    const node = parseForwardNode('tcp:8080');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.TCP);
+    expect(node!.value).toBe('8080');
+  });
+
+  it('should parse tcp node with port 0', () => {
+    const node = parseForwardNode('tcp:0');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.TCP);
+    expect(node!.value).toBe('0');
+  });
+
+  it('should parse jdwp node', () => {
+    const node = parseForwardNode('jdwp:1234');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.JDWP);
+    expect(node!.value).toBe('1234');
+  });
+
+  it('should parse ark node with complex value', () => {
+    const node = parseForwardNode('ark:1234@5678@Debugger');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.ARK);
+    expect(node!.value).toBe('1234@5678@Debugger');
+  });
+
+  it('should parse localabstract node', () => {
+    const node = parseForwardNode('localabstract:mysocket');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.ABSTRACT);
+    expect(node!.value).toBe('mysocket');
+  });
+
+  it('should parse localfilesystem node', () => {
+    const node = parseForwardNode('localfilesystem:/tmp/sock');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.FILESYSTEM);
+    expect(node!.value).toBe('/tmp/sock');
+  });
+
+  it('should parse dev node', () => {
+    const node = parseForwardNode('dev:/dev/ttyUSB0');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.DEV);
+    expect(node!.value).toBe('/dev/ttyUSB0');
+  });
+
+  it('should parse reserved node', () => {
+    const node = parseForwardNode('reserved:something');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.RESERVED);
+    expect(node!.value).toBe('something');
+  });
+
+  it('should return null for empty string', () => {
+    expect(parseForwardNode('')).toBeNull();
+  });
+
+  it('should return null for null/undefined', () => {
+    expect(parseForwardNode(null as any)).toBeNull();
+    expect(parseForwardNode(undefined as any)).toBeNull();
+  });
+
+  it('should return null for unknown prefix', () => {
+    expect(parseForwardNode('unknown:value')).toBeNull();
+  });
+
+  it('should return null for prefix with no value', () => {
+    expect(parseForwardNode('tcp:')).toBeNull();
+  });
+
+  it('should return null for plain string with no colon', () => {
+    expect(parseForwardNode('something')).toBeNull();
+  });
+
+  it('should handle whitespace-padded input', () => {
+    const node = parseForwardNode('  tcp:8080  ');
+    expect(node).not.toBeNull();
+    expect(node!.type).toBe(ForwardType.TCP);
+    expect(node!.value).toBe('8080');
+  });
+});
+
+describe('formatForwardNode', () => {
+  it('should format tcp node', () => {
+    expect(formatForwardNode({ type: ForwardType.TCP, value: '8080' })).toBe('tcp:8080');
+  });
+
+  it('should format jdwp node', () => {
+    expect(formatForwardNode({ type: ForwardType.JDWP, value: '1234' })).toBe('jdwp:1234');
+  });
+
+  it('should format ark node', () => {
+    expect(formatForwardNode({ type: ForwardType.ARK, value: '1234@5678@Debugger' })).toBe('ark:1234@5678@Debugger');
+  });
+
+  it('should format localabstract node', () => {
+    expect(formatForwardNode({ type: ForwardType.ABSTRACT, value: 'mysocket' })).toBe('localabstract:mysocket');
+  });
+
+  it('should format localfilesystem node', () => {
+    expect(formatForwardNode({ type: ForwardType.FILESYSTEM, value: '/tmp/sock' })).toBe('localfilesystem:/tmp/sock');
+  });
+
+  it('should format dev node', () => {
+    expect(formatForwardNode({ type: ForwardType.DEV, value: '/dev/ttyUSB0' })).toBe('dev:/dev/ttyUSB0');
+  });
+
+  it('should format reserved node', () => {
+    expect(formatForwardNode({ type: ForwardType.RESERVED, value: 'anything' })).toBe('reserved:anything');
+  });
+});
+
+describe('parseForwardNode / formatForwardNode roundtrip', () => {
+  it.each([
+    'tcp:8080',
+    'tcp:0',
+    'jdwp:5678',
+    'ark:1234@5678@Debugger',
+    'localabstract:mysocket',
+    'localfilesystem:/tmp/sock',
+    'dev:/dev/ttyUSB0',
+    'reserved:something',
+  ])('should roundtrip %s', (spec) => {
+    const node = parseForwardNode(spec);
+    expect(node).not.toBeNull();
+    expect(formatForwardNode(node!)).toBe(spec);
+  });
+});
+
+// ============================================================================
+// ForwardType enum
+// ============================================================================
+
+describe('ForwardType enum', () => {
+  it('should have all 7 forward types', () => {
+    expect(ForwardType.TCP).toBe('tcp');
+    expect(ForwardType.JDWP).toBe('jdwp');
+    expect(ForwardType.ARK).toBe('ark');
+    expect(ForwardType.ABSTRACT).toBe('localabstract');
+    expect(ForwardType.FILESYSTEM).toBe('localfilesystem');
+    expect(ForwardType.DEV).toBe('dev');
+    expect(ForwardType.RESERVED).toBe('reserved');
+  });
+
+  it('should have exactly 7 members', () => {
+    const keys = Object.keys(ForwardType).filter(k => isNaN(Number(k)));
+    expect(keys.length).toBe(7);
+  });
+});
+
+describe('ForwardState enum', () => {
+  it('should have correct values', () => {
+    expect(ForwardState.IDLE).toBe('idle');
+    expect(ForwardState.LISTENING).toBe('listening');
+    expect(ForwardState.CONNECTING).toBe('connecting');
+    expect(ForwardState.FORAWRDING).toBe('forwarding');
+    expect(ForwardState.CLOSED).toBe('closed');
+    expect(ForwardState.ERROR).toBe('error');
+  });
+});
+
+// ============================================================================
+// HdcForward
+// ============================================================================
 
 describe('HdcForward', () => {
   describe('constructor', () => {
@@ -130,10 +313,10 @@ describe('HdcForward', () => {
       });
 
       await forward.start();
-      
+
       // Give event time to fire
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
       // listeningPort should be updated
       expect(listeningPort).toBeGreaterThanOrEqual(0);
 
@@ -204,6 +387,127 @@ describe('HdcForward', () => {
     });
   });
 });
+
+// ============================================================================
+// HdcReverseForward
+// ============================================================================
+
+describe('HdcReverseForward', () => {
+  it('should create with local and remote nodes', () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    expect(reverse.getId()).toBeDefined();
+    expect(reverse.getId().length).toBe(8);
+    expect(reverse.getState()).toBe(ForwardState.IDLE);
+    expect(reverse.getLocalNode()).toBe(localNode);
+    expect(reverse.getRemoteNode()).toBe(remoteNode);
+    expect(reverse.getBytesForwarded()).toBe(0);
+    expect(reverse.getConnections()).toBe(0);
+  });
+
+  it('should start and become active', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    await reverse.start();
+
+    expect(reverse.getState()).toBe(ForwardState.FORAWRDING);
+    expect(reverse.isActive()).toBe(true);
+
+    await reverse.stop();
+  });
+
+  it('should emit listening event on start', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    let listeningFired = false;
+    reverse.on('listening', () => {
+      listeningFired = true;
+    });
+
+    await reverse.start();
+    expect(listeningFired).toBe(true);
+
+    await reverse.stop();
+  });
+
+  it('should throw error when already started', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    await reverse.start();
+
+    await expect(reverse.start()).rejects.toThrow('already started');
+
+    await reverse.stop();
+  });
+
+  it('should stop and become closed', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    await reverse.start();
+    await reverse.stop();
+
+    expect(reverse.getState()).toBe(ForwardState.CLOSED);
+    expect(reverse.isActive()).toBe(false);
+  });
+
+  it('should emit close event on stop', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    let closed = false;
+    reverse.on('close', () => {
+      closed = true;
+    });
+
+    await reverse.start();
+    await reverse.stop();
+
+    expect(closed).toBe(true);
+  });
+
+  it('should stop idempotently', async () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    await reverse.start();
+    await reverse.stop();
+    await reverse.stop();
+
+    expect(reverse.getState()).toBe(ForwardState.CLOSED);
+  });
+
+  it('should generate correct task string', () => {
+    const localNode: ForwardNode = { type: ForwardType.TCP, value: '8080' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    expect(reverse.getTaskStr()).toBe('rport tcp:9090 tcp:8080');
+  });
+
+  it('should generate correct task string with abstract nodes', () => {
+    const localNode: ForwardNode = { type: ForwardType.ABSTRACT, value: 'mysocket' };
+    const remoteNode: ForwardNode = { type: ForwardType.TCP, value: '9090' };
+    const reverse = new HdcReverseForward(localNode, remoteNode);
+
+    expect(reverse.getTaskStr()).toBe('rport tcp:9090 localabstract:mysocket');
+  });
+});
+
+// ============================================================================
+// HdcForwardManager
+// ============================================================================
 
 describe('HdcForwardManager', () => {
   let manager: HdcForwardManager;
@@ -326,25 +630,5 @@ describe('HdcForwardManager', () => {
 
       expect(manager.count).toBe(0);
     });
-  });
-});
-
-describe('ForwardState enum', () => {
-  it('should have correct values', () => {
-    expect(ForwardState.IDLE).toBe('idle');
-    expect(ForwardState.LISTENING).toBe('listening');
-    expect(ForwardState.CONNECTING).toBe('connecting');
-    expect(ForwardState.FORAWRDING).toBe('forwarding');
-    expect(ForwardState.CLOSED).toBe('closed');
-    expect(ForwardState.ERROR).toBe('error');
-  });
-});
-
-describe('ForwardType enum', () => {
-  it('should have correct values', () => {
-    expect(ForwardType.TCP).toBe('tcp');
-    expect(ForwardType.JDWP).toBe('jdwp');
-    expect(ForwardType.ABSTRACT).toBe('abstract');
-    expect(ForwardType.RESERVED).toBe('reserved');
   });
 });

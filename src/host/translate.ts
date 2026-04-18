@@ -6,6 +6,7 @@
  */
 
 import { CommandFlag } from '../index.js';
+import { parseExtendedShellArgs, encodeExtendedShellTlv } from './shell.js';
 
 export interface FormatCommand {
   cmdFlag: CommandFlag;
@@ -37,10 +38,12 @@ Commands:
   tmode usb       Switch device to USB mode
   tmode port <port>    Switch device to TCP mode
   shell [command]       Run shell command on device
-  file send <local> <remote>  Send file to device
-  file recv <remote> <local>  Receive file from device
-  install <package>     Install application
-  uninstall <package>   Uninstall application
+  file send [-a] [-z] [-sync] [-m] <local> <remote>  Send file/dir to device
+  file recv [-a] [-z] <remote> <local>              Receive file from device
+  install [-r] [-g] [-d] <path>  Install application
+  uninstall [-k] [-n <name>] [-m <module>] [-v <ver>] [-u <user>] <package>
+                                Uninstall application
+  sideload <path>       Sideload OTA package
   fport <local> <remote>  Forward port
   rport <remote> <local>  Reverse forward port
   fport ls        List port forwards
@@ -183,6 +186,40 @@ export function forwardPort(input: string, cmd: FormatCommand): string {
 }
 
 /**
+ * Parse reverse port command (rport)
+ * rport <remote> <local> - reverse forward: device initiates connection
+ */
+export function reversePort(input: string, cmd: FormatCommand): string {
+  const trimmed = input.trim();
+
+  if (!trimmed) {
+    cmd.bJumpDo = true;
+    return 'Incorrect reverse forward command';
+  }
+
+  // Remove "rport" prefix if present
+  const withoutPrefix = trimmed.replace(/^rport\s+/i, '').trim();
+  const parts = withoutPrefix.split(/\s+/);
+
+  // rport requires exactly two node specs: <remote> <local>
+  if (parts.length < 2) {
+    cmd.bJumpDo = true;
+    return 'Incorrect reverse forward command';
+  }
+
+  // Both parts must contain a colon (forward node spec format)
+  if (!parts[0].includes(':') || !parts[1].includes(':')) {
+    cmd.bJumpDo = true;
+    return 'Incorrect reverse forward command';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_FORWARD_INIT;
+  cmd.parameters = `rport ${withoutPrefix}`;
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
  * Parse run mode command (tmode)
  */
 export function runMode(input: string, cmd: FormatCommand): string {
@@ -217,14 +254,17 @@ export function runMode(input: string, cmd: FormatCommand): string {
 
   // port mode
   if (parts.length < 2) {
-    cmd.bJumpDo = true;
-    return 'Incorrect port range';
+    // "tmode port" without a port number defaults to tcp mode
+    cmd.cmdFlag = CommandFlag.CMD_UNITY_RUNMODE;
+    cmd.parameters = 'tcp';
+    cmd.bJumpDo = false;
+    return '';
   }
 
   const portStr = parts[1];
   if (portStr.toLowerCase() === 'close') {
     cmd.cmdFlag = CommandFlag.CMD_UNITY_RUNMODE;
-    cmd.parameters = 'port close';
+    cmd.parameters = 'tcp close';
     cmd.bJumpDo = false;
     return '';
   }
@@ -236,23 +276,405 @@ export function runMode(input: string, cmd: FormatCommand): string {
   }
 
   cmd.cmdFlag = CommandFlag.CMD_UNITY_RUNMODE;
-  cmd.parameters = `port ${port}`;
+  cmd.parameters = `tcp ${port}`;
   cmd.bJumpDo = false;
   return '';
 }
 
 /**
  * Parse target reboot command
+ *
+ * target boot            → parameters: "reboot"
+ * target boot -bootloader → parameters: "reboot bootloader"
+ * target boot -recovery   → parameters: "reboot recovery"
+ * target boot MYMODE      → parameters: "reboot MYMODE"
  */
 export function targetReboot(input: string, cmd: FormatCommand): void {
   const trimmed = input.trim();
   cmd.cmdFlag = CommandFlag.CMD_UNITY_REBOOT;
 
-  if (trimmed.includes('-bootloader')) {
-    cmd.parameters = 'bootloader';
-  } else {
-    cmd.parameters = '';
+  if (!trimmed) {
+    cmd.parameters = 'reboot';
+    return;
   }
+
+  const parts = trimmed.split(/\s+/);
+  const first = parts[0];
+
+  if (first === '-bootloader') {
+    cmd.parameters = 'reboot bootloader';
+  } else if (first === '-recovery') {
+    cmd.parameters = 'reboot recovery';
+  } else {
+    cmd.parameters = `reboot ${first}`;
+  }
+}
+
+/**
+ * Parse file transfer command.
+ *
+ * Syntax:
+ *   file send [-a] [-z] [-sync] [-m] <local> <remote>
+ *   file recv [-a] [-z] <remote> <local>
+ *
+ * Options:
+ *   -a      preserve timestamp (holdTimestamp)
+ *   -z      enable compression
+ *   -sync   only update if newer
+ *   -m      directory transfer mode
+ */
+export function fileTransfer(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/);
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect file command';
+  }
+
+  const subCmd = parts[0].toLowerCase();
+
+  if (subCmd !== 'send' && subCmd !== 'recv') {
+    cmd.bJumpDo = true;
+    return 'Incorrect file command';
+  }
+
+  // Parse flags and collect remaining positional args
+  const flags: string[] = [];
+  const positional: string[] = [];
+
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i].startsWith('-')) {
+      flags.push(parts[i]);
+    } else {
+      positional.push(parts[i]);
+    }
+  }
+
+  // Validate we have 2 positional args (local + remote or remote + local)
+  if (positional.length < 2) {
+    cmd.bJumpDo = true;
+    return `Incorrect file ${subCmd} command: need <source> and <destination>`;
+  }
+
+  // Build parameters string with flags encoded
+  const flagStr = flags.join(',');
+  const src = positional[0];
+  const dst = positional[1];
+
+  if (subCmd === 'send') {
+    cmd.cmdFlag = CommandFlag.CMD_FILE_SEND;
+    cmd.parameters = `${flagStr}|${src}|${dst}`;
+    cmd.bJumpDo = false;
+  } else {
+    cmd.cmdFlag = CommandFlag.CMD_FILE_RECV;
+    cmd.parameters = `${flagStr}|${dst}|${src}`;
+    cmd.bJumpDo = false;
+  }
+
+  return '';
+}
+
+/**
+ * Extract file transfer flags from a parameters string produced by fileTransfer().
+ * Returns an object with the parsed flags.
+ */
+export function parseFileTransferParams(params: string): {
+  holdTimestamp: boolean;
+  compress: boolean;
+  updateIfNew: boolean;
+  directoryMode: boolean;
+  localPath: string;
+  remotePath: string;
+} {
+  const [flagStr, ...paths] = params.split('|');
+  const flags = flagStr ? flagStr.split(',') : [];
+
+  return {
+    holdTimestamp: flags.includes('-a'),
+    compress: flags.includes('-z'),
+    updateIfNew: flags.includes('-sync'),
+    directoryMode: flags.includes('-m'),
+    localPath: paths[0] || '',
+    remotePath: paths[1] || '',
+  };
+}
+
+/**
+ * Parse install command.
+ *
+ * Syntax:
+ *   install [-r] [-g] [-d] <path>
+ *
+ * Options:
+ *   -r   reinstall (replace existing)
+ *   -g   grant all runtime permissions
+ *   -d   allow version downgrade
+ */
+export function installApp(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect install command: need <package path>';
+  }
+
+  const flags: string[] = [];
+  const positional: string[] = [];
+
+  for (const part of parts) {
+    if (part === '-r') {
+      flags.push('r');
+    } else if (part === '-g') {
+      flags.push('g');
+    } else if (part === '-d') {
+      flags.push('d');
+    } else if (part.startsWith('-')) {
+      cmd.bJumpDo = true;
+      return `Unknown install flag: ${part}`;
+    } else {
+      positional.push(part);
+    }
+  }
+
+  if (positional.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect install command: need <package path>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_APP_INSTALL;
+  cmd.parameters = `${flags.join('')}|${positional.join(',')}`;
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse uninstall command.
+ *
+ * Syntax:
+ *   uninstall [-k] [-n <name>] [-m <module>] [-v <version>] [-u <user>] <package>
+ *
+ * Options:
+ *   -k           keep data
+ *   -n <name>    module name
+ *   -m <module>  module name (alias for -n)
+ *   -v <version> version
+ *   -u <user>    user ID
+ */
+export function uninstallApp(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect uninstall command: need <package name>';
+  }
+
+  const flags: string[] = [];
+  const extras: string[] = [];
+  let packageName = '';
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+
+    if (part === '-k') {
+      flags.push('k');
+    } else if (part === '-n' || part === '-m') {
+      // Module name
+      if (i + 1 >= parts.length) {
+        cmd.bJumpDo = true;
+        return `Missing value for ${part}`;
+      }
+      extras.push(`-n ${parts[++i]}`);
+    } else if (part === '-v') {
+      if (i + 1 >= parts.length) {
+        cmd.bJumpDo = true;
+        return 'Missing value for -v';
+      }
+      extras.push(`-v ${parts[++i]}`);
+    } else if (part === '-u') {
+      if (i + 1 >= parts.length) {
+        cmd.bJumpDo = true;
+        return 'Missing value for -u';
+      }
+      extras.push(`-u ${parts[++i]}`);
+    } else if (part.startsWith('-')) {
+      cmd.bJumpDo = true;
+      return `Unknown uninstall flag: ${part}`;
+    } else {
+      packageName = part;
+    }
+  }
+
+  if (!packageName) {
+    cmd.bJumpDo = true;
+    return 'Incorrect uninstall command: need <package name>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_APP_UNINSTALL;
+  const flagStr = flags.join('');
+  const extraStr = extras.length > 0 ? ` ${extras.join(' ')}` : '';
+  cmd.parameters = `${flagStr}|${packageName}${extraStr}`;
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse sideload command.
+ *
+ * Syntax:
+ *   sideload <path>
+ */
+export function sideloadApp(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect sideload command: need <package path>';
+  }
+
+  // Reject any flags - sideload takes only a path
+  if (parts[0].startsWith('-')) {
+    cmd.bJumpDo = true;
+    return `Incorrect sideload command: unexpected flag ${parts[0]}`;
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_APP_SIDELOAD;
+  cmd.parameters = parts[0];
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse update command.
+ *
+ * Syntax:
+ *   update <package>
+ */
+export function updateFirmware(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect update command: need <package path>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_FLASHD_UPDATE_INIT;
+  cmd.parameters = parts[0];
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse flash command.
+ *
+ * Syntax:
+ *   flash [-f] <partition> <image>
+ */
+export function flashPartition(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect flash command: need <partition> <image>';
+  }
+
+  let force = false;
+  const positional: string[] = [];
+
+  for (const part of parts) {
+    if (part === '-f') {
+      force = true;
+    } else if (part.startsWith('-')) {
+      cmd.bJumpDo = true;
+      return `Unknown flash flag: ${part}`;
+    } else {
+      positional.push(part);
+    }
+  }
+
+  if (positional.length < 2) {
+    cmd.bJumpDo = true;
+    return 'Incorrect flash command: need <partition> <image>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_FLASHD_FLASH_INIT;
+  cmd.parameters = `${force ? '-f|' : ''}${positional[0]}|${positional[1]}`;
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse erase command.
+ *
+ * Syntax:
+ *   erase [-f] <partition>
+ */
+export function erasePartition(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect erase command: need <partition>';
+  }
+
+  let force = false;
+  let partition = '';
+
+  for (const part of parts) {
+    if (part === '-f') {
+      force = true;
+    } else if (part.startsWith('-')) {
+      cmd.bJumpDo = true;
+      return `Unknown erase flag: ${part}`;
+    } else {
+      partition = part;
+    }
+  }
+
+  if (!partition) {
+    cmd.bJumpDo = true;
+    return 'Incorrect erase command: need <partition>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_FLASHD_ERASE;
+  cmd.parameters = `${force ? '-f|' : ''}${partition}`;
+  cmd.bJumpDo = false;
+  return '';
+}
+
+/**
+ * Parse format command.
+ *
+ * Syntax:
+ *   format [-f] <partition>
+ */
+export function formatPartition(cmd: FormatCommand): string {
+  const parts = cmd.parameters.trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length === 0) {
+    cmd.bJumpDo = true;
+    return 'Incorrect format command: need <partition>';
+  }
+
+  let force = false;
+  let partition = '';
+
+  for (const part of parts) {
+    if (part === '-f') {
+      force = true;
+    } else if (part.startsWith('-')) {
+      cmd.bJumpDo = true;
+      return `Unknown format flag: ${part}`;
+    } else {
+      partition = part;
+    }
+  }
+
+  if (!partition) {
+    cmd.bJumpDo = true;
+    return 'Incorrect format command: need <partition>';
+  }
+
+  cmd.cmdFlag = CommandFlag.CMD_FLASHD_FORMAT;
+  cmd.parameters = `${force ? '-f|' : ''}${partition}`;
+  cmd.bJumpDo = false;
+  return '';
 }
 
 /**
@@ -290,17 +712,43 @@ export function string2FormatCommand(
       return '';
 
     case 'start':
-      cmd.bJumpDo = true;
-      return 'Server started\n';
+      // start [-r]
+      cmd.cmdFlag = CommandFlag.CMD_SERVICE_START;
+      if (parts.length > 1) {
+        cmd.parameters = ['start', ...parts.slice(1)].join(' ');
+      } else {
+        cmd.parameters = 'start';
+      }
+      return '';
 
     case 'checkserver':
-      cmd.bJumpDo = true;
-      return 'Server version: 0.0.1\n';
+      cmd.cmdFlag = CommandFlag.CMD_CHECK_SERVER;
+      cmd.parameters = 'checkserver';
+      return '';
+
+    case 'checkdevice':
+      // checkdevice <key>
+      if (parts.length < 2) {
+        cmd.bJumpDo = true;
+        return 'Incorrect checkdevice command: need <key>\n';
+      }
+      cmd.cmdFlag = CommandFlag.CMD_CHECK_DEVICE;
+      cmd.parameters = ['checkdevice', parts[1]].join(' ');
+      return '';
+
+    case 'wait':
+      cmd.cmdFlag = CommandFlag.CMD_WAIT_FOR;
+      cmd.parameters = 'wait';
+      return '';
 
     case 'list':
       if (parts[1]?.toLowerCase() === 'targets') {
-        cmd.bJumpDo = false;
-        cmd.parameters = 'list targets';
+        cmd.cmdFlag = CommandFlag.CMD_KERNEL_TARGET_LIST;
+        if (parts.length > 2) {
+          cmd.parameters = ['list', 'targets', ...parts.slice(2)].join(' ');
+        } else {
+          cmd.parameters = 'list targets';
+        }
         return '';
       }
       break;
@@ -316,22 +764,133 @@ export function string2FormatCommand(
         targetReboot(parts.slice(2).join(' '), cmd);
         return '';
       }
+      if (parts[1]?.toLowerCase() === 'mount') {
+        cmd.cmdFlag = CommandFlag.CMD_UNITY_REMOUNT;
+        cmd.parameters = 'remount';
+        return '';
+      }
       break;
 
     case 'fport':
-    case 'rport':
       return forwardPort(cmd.parameters, cmd);
 
-    case 'track-jpid':
-    case 'jpid':
-      if (parts[1] === '-p') {
-        cmd.cmdFlag = CommandFlag.CMD_JDWP_TRACK;
-        cmd.parameters = 'p';
+    case 'rport':
+      return reversePort(cmd.parameters, cmd);
+
+    case 'smode':
+      // smode [-r]
+      cmd.cmdFlag = CommandFlag.CMD_UNITY_ROOTRUN;
+      if (parts.length > 1 && parts[1] === '-r') {
+        cmd.parameters = 'unroot';
       } else {
-        cmd.cmdFlag = CommandFlag.CMD_JDWP_TRACK;
-        cmd.parameters = '';
+        cmd.parameters = 'root';
       }
       return '';
+
+    case 'hilog':
+      // hilog [options]
+      cmd.cmdFlag = CommandFlag.CMD_UNITY_HILOG;
+      if (parts.length > 1) {
+        cmd.parameters = ['hilog', ...parts.slice(1)].join(' ');
+      } else {
+        cmd.parameters = 'hilog';
+      }
+      return '';
+
+    case 'bugreport':
+      // bugreport [FILE]
+      cmd.cmdFlag = CommandFlag.CMD_UNITY_BUGREPORT_INIT;
+      if (parts.length > 1) {
+        cmd.parameters = ['bugreport', parts[1]].join(' ');
+      } else {
+        cmd.parameters = 'bugreport';
+      }
+      return '';
+
+    case 'jpid':
+      cmd.cmdFlag = CommandFlag.CMD_JDWP_LIST;
+      cmd.parameters = 'jpid';
+      return '';
+
+    case 'track-jpid':
+      // track-jpid [-a|-p]
+      cmd.cmdFlag = CommandFlag.CMD_JDWP_TRACK;
+      if (parts.length > 1) {
+        cmd.parameters = ['track-jpid', ...parts.slice(1)].join(' ');
+      } else {
+        cmd.parameters = 'track-jpid';
+      }
+      return '';
+
+    case 'discover':
+      cmd.cmdFlag = CommandFlag.CMD_KERNEL_TARGET_DISCOVER;
+      cmd.parameters = 'discover';
+      return '';
+
+    case 'any':
+      cmd.cmdFlag = CommandFlag.CMD_KERNEL_TARGET_ANY;
+      cmd.parameters = 'any';
+      return '';
+
+    case 'shell': {
+      const shellParts = parts.slice(1);
+
+      // Check if this is an extended shell command (has -b flag)
+      if (shellParts.length > 0 && shellParts.includes('-b')) {
+        const extOptions = parseExtendedShellArgs(shellParts);
+        if (extOptions) {
+          cmd.cmdFlag = CommandFlag.CMD_UNITY_EXECUTE_EX;
+          cmd.parameters = encodeExtendedShellTlv(extOptions);
+          return '';
+        }
+        // Failed to parse extended args
+        cmd.bJumpDo = true;
+        return 'Invalid extended shell command\n';
+      }
+
+      // Regular shell command
+      if (shellParts.length === 0) {
+        // Interactive shell - no command specified
+        cmd.cmdFlag = CommandFlag.CMD_UNITY_EXECUTE;
+        cmd.parameters = '';
+      } else {
+        cmd.cmdFlag = CommandFlag.CMD_UNITY_EXECUTE;
+        cmd.parameters = shellParts.join(' ');
+      }
+      return '';
+    }
+
+    case 'file': {
+      return fileTransfer(cmd);
+    }
+
+    case 'install': {
+      return installApp(cmd);
+    }
+
+    case 'uninstall': {
+      return uninstallApp(cmd);
+    }
+
+    case 'sideload': {
+      return sideloadApp(cmd);
+    }
+
+    case 'update': {
+      return updateFirmware(cmd);
+    }
+
+    case 'flash': {
+      return flashPartition(cmd);
+    }
+
+    case 'erase': {
+      return erasePartition(cmd);
+    }
+
+    case 'format': {
+      return formatPartition(cmd);
+    }
 
     default:
       break;

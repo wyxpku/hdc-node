@@ -22,7 +22,7 @@ import {
 
 describe('Protocol Constants', () => {
   it('should have correct version', () => {
-    expect(HDC_VERSION_NUMBER).toBe(0x30200100);
+    expect(HDC_VERSION_NUMBER).toBe(0x30200300);
     expect(HDC_VERSION_STRING).toBe('3.2.0');
   });
 
@@ -69,9 +69,9 @@ describe('MessageLevel enum', () => {
 
 describe('CommandId enum', () => {
   it('should have kernel commands', () => {
-    expect(CommandId.CMD_KERNEL_HELP).toBe(1);
-    expect(CommandId.CMD_KERNEL_HANDSHAKE).toBe(2);
-    expect(CommandId.CMD_KERNEL_CHANNEL_CLOSE).toBe(3);
+    expect(CommandId.CMD_KERNEL_HELP).toBe(0);
+    expect(CommandId.CMD_KERNEL_HANDSHAKE).toBe(1);
+    expect(CommandId.CMD_KERNEL_CHANNEL_CLOSE).toBe(2);
     expect(CommandId.CMD_KERNEL_TARGET_DISCOVER).toBe(4);
   });
 
@@ -128,7 +128,6 @@ describe('isValidCommandId function', () => {
   });
 
   it('should return false for invalid command IDs', () => {
-    expect(isValidCommandId(0)).toBe(false);
     expect(isValidCommandId(-1)).toBe(false);
     expect(isValidCommandId(99999)).toBe(false);
   });

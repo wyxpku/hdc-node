@@ -1,7 +1,10 @@
 /**
  * HDC File Transfer Module
  *
- * Provides file send/recv functionality.
+ * Provides file send/recv functionality with TransferConfig negotiation,
+ * TransferPayload chunk headers, directory TAR support, and configurable
+ * file transfer options.
+ *
  * Ported from: hdc-source/src/common/transfer.cpp
  */
 
@@ -9,19 +12,43 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as net from 'net';
-import { createPacket, parsePacket } from '../common/message.js';
+import { createPacket, parsePacket, PAYLOAD_PROTECT_VCODE } from '../common/message.js';
+import { CommandId } from '../common/protocol.js';
 import { GetRandomString } from '../common/base.js';
+import { PayloadProtect } from '../common/serialization.js';
+import {
+  TransferConfig,
+  TransferPayload,
+  encodeTransferConfig,
+  decodeTransferConfig,
+  encodeTransferPayload,
+  decodeTransferPayload,
+  TRANSFER_PAYLOAD_SIZE,
+} from '../common/transfer.js';
+import {
+  TarHeader,
+  encodeTarHeader,
+  decodeTarHeader,
+  TAR_HEADER_SIZE,
+} from '../common/header.js';
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 export const DEFAULT_CHUNK_SIZE = 64 * 1024; // 64KB
+/** High-speed mode chunk size used when server supports huge buffer */
+export const HIGH_SPEED_CHUNK_SIZE = 512 * 1024; // 512KB
+
 export const FILE_SEND_PREFIX = 'file:send:';
 export const FILE_RECV_PREFIX = 'file:recv:';
 export const FILE_DATA_PREFIX = 'file:data:';
 export const FILE_FINISH = 'file:finish';
 export const FILE_ERROR = 'file:error';
+
+/** Compress types matching the C++ enum */
+export const COMPRESS_NONE = 0;
+export const COMPRESS_GZIP = 1;
 
 export enum TransferState {
   IDLE = 'idle',
@@ -49,13 +76,70 @@ export interface TransferOptions {
   onProgress?: (progress: TransferProgress) => void;
   preserveTimestamp?: boolean;
   compress?: boolean;
+  /** If true, only update file if newer (maps to -sync flag) */
+  updateIfNew?: boolean;
+  /** Whether server supports huge buffer for high-speed mode */
+  serverHugeBuffer?: boolean;
 }
 
 export interface FileInfo {
   path: string;
   size: number;
   mtime: Date;
+  atime: Date;
   isDirectory: boolean;
+}
+
+/**
+ * Parsed file transfer command options from CLI
+ */
+export interface FileTransferFlags {
+  holdTimestamp: boolean;   // -a flag
+  compress: boolean;        // -z flag
+  updateIfNew: boolean;     // -sync flag
+  directoryMode: boolean;   // -m flag (directory transfer)
+}
+
+// ============================================================================
+// Helper
+// ============================================================================
+
+function fileProtect(commandFlag: number = 0): PayloadProtect {
+  return {
+    channelId: 0,
+    commandFlag,
+    checkSum: 0,
+    vCode: PAYLOAD_PROTECT_VCODE,
+  };
+}
+
+/**
+ * Build a TransferConfig from file stats and transfer options.
+ */
+function buildTransferConfig(
+  filePath: string,
+  remotePath: string,
+  stats: fs.Stats,
+  options: Required<TransferOptions>,
+  functionName: string = 'send',
+  clientCwd: string = '',
+): TransferConfig {
+  const compressType = options.compress ? COMPRESS_GZIP : COMPRESS_NONE;
+  return {
+    fileSize: stats.size,
+    atime: Math.floor(stats.atimeMs / 1000),
+    mtime: Math.floor(stats.mtimeMs / 1000),
+    options: '',
+    path: remotePath,
+    optionalName: path.basename(filePath),
+    updateIfNew: options.updateIfNew ?? false,
+    compressType,
+    holdTimestamp: options.preserveTimestamp,
+    functionName,
+    clientCwd,
+    reserve1: '',
+    reserve2: '',
+  };
 }
 
 // ============================================================================
@@ -84,11 +168,16 @@ export class HdcFileTransfer extends EventEmitter {
     this.localPath = localPath;
     this.remotePath = remotePath;
     this.transferId = GetRandomString(8);
+    const effectiveChunkSize = options.serverHugeBuffer
+      ? (options.chunkSize || HIGH_SPEED_CHUNK_SIZE)
+      : (options.chunkSize || DEFAULT_CHUNK_SIZE);
     this.options = {
-      chunkSize: options.chunkSize || DEFAULT_CHUNK_SIZE,
+      chunkSize: effectiveChunkSize,
       onProgress: options.onProgress ?? (() => {}),
       preserveTimestamp: options.preserveTimestamp ?? false,
       compress: options.compress ?? false,
+      updateIfNew: options.updateIfNew ?? false,
+      serverHugeBuffer: options.serverHugeBuffer ?? false,
     };
   }
 
@@ -192,7 +281,9 @@ export class HdcFileSender extends HdcFileTransfer {
   }
 
   /**
-   * Start sending file
+   * Start sending file with TransferConfig negotiation.
+   * Sends TransferConfig (protobuf) with file metadata before data chunks.
+   * Each data chunk is prefixed with a 16-byte TransferPayload header.
    */
   async start(): Promise<void> {
     if (this.state !== TransferState.IDLE) {
@@ -211,10 +302,18 @@ export class HdcFileSender extends HdcFileTransfer {
 
       this.totalBytes = stats.size;
 
-      // Send file info
-      const fileInfo = `${FILE_SEND_PREFIX}${this.remotePath}:${this.totalBytes}`;
-      const infoPacket = createPacket(Buffer.from(fileInfo));
-      this.socket.write(infoPacket);
+      // Build and send TransferConfig
+      const config = buildTransferConfig(
+        this.localPath,
+        this.remotePath,
+        stats,
+        this.options,
+        'send',
+        process.cwd(),
+      );
+      const configBuf = encodeTransferConfig(config);
+      const configPacket = createPacket(configBuf, fileProtect(CommandId.CMD_FILE_BEGIN));
+      this.socket.write(configPacket);
 
       // Start file stream
       this.state = TransferState.TRANSFERRING;
@@ -232,10 +331,11 @@ export class HdcFileSender extends HdcFileTransfer {
   }
 
   /**
-   * Send file content
+   * Send file content with TransferPayload headers on each chunk.
    */
   private async sendFile(): Promise<void> {
     return new Promise((resolve, reject) => {
+      let chunkIndex = 0;
       this.fileStream = fs.createReadStream(this.localPath, {
         highWaterMark: this.options.chunkSize,
       });
@@ -247,15 +347,29 @@ export class HdcFileSender extends HdcFileTransfer {
         }
 
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const packet = createPacket(buf);
+
+        // Build TransferPayload header for this chunk
+        const payloadHeader: TransferPayload = {
+          index: chunkIndex,
+          compressType: this.options.compress ? COMPRESS_GZIP : COMPRESS_NONE,
+          compressSize: buf.length,
+          uncompressSize: buf.length,
+        };
+        const headerBuf = encodeTransferPayload(payloadHeader);
+
+        // Combine header + data into one packet
+        const combinedPayload = Buffer.concat([headerBuf, buf]);
+        const packet = createPacket(combinedPayload, fileProtect(CommandId.CMD_FILE_DATA));
         this.socket.write(packet);
+
         this.bytesTransferred += buf.length;
+        chunkIndex++;
         this.emitProgress();
       });
 
       this.fileStream.on('end', () => {
         // Send finish marker
-        const finishPacket = createPacket(Buffer.from(FILE_FINISH));
+        const finishPacket = createPacket(Buffer.from(FILE_FINISH), fileProtect(CommandId.CMD_FILE_FINISH));
         this.socket.write(finishPacket);
         resolve();
       });
@@ -289,7 +403,7 @@ export class HdcFileReceiver extends HdcFileTransfer {
   }
 
   /**
-   * Start receiving file
+   * Start receiving file with TransferConfig negotiation.
    */
   async start(): Promise<void> {
     if (this.state !== TransferState.IDLE) {
@@ -304,9 +418,24 @@ export class HdcFileReceiver extends HdcFileTransfer {
       const parentDir = path.dirname(this.localPath);
       await fs.promises.mkdir(parentDir, { recursive: true });
 
-      // Send file request
-      const request = `${FILE_RECV_PREFIX}${this.remotePath}`;
-      const requestPacket = createPacket(Buffer.from(request));
+      // Send file request with TransferConfig
+      const requestConfig: TransferConfig = {
+        fileSize: 0,
+        atime: 0,
+        mtime: 0,
+        options: '',
+        path: this.remotePath,
+        optionalName: '',
+        updateIfNew: this.options.updateIfNew,
+        compressType: this.options.compress ? COMPRESS_GZIP : COMPRESS_NONE,
+        holdTimestamp: this.options.preserveTimestamp,
+        functionName: 'recv',
+        clientCwd: process.cwd(),
+        reserve1: '',
+        reserve2: '',
+      };
+      const configBuf = encodeTransferConfig(requestConfig);
+      const requestPacket = createPacket(configBuf, fileProtect(CommandId.CMD_FILE_INIT));
       this.socket.write(requestPacket);
 
       // Setup data handler
@@ -325,12 +454,12 @@ export class HdcFileReceiver extends HdcFileTransfer {
   }
 
   /**
-   * Receive file content
+   * Receive file content, parsing TransferPayload headers from each chunk.
    */
   private async receiveFile(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.fileStream = fs.createWriteStream(this.localPath);
-      let expectingInfo = true;
+      let expectingConfig = true;
 
       const dataHandler = (data: Buffer) => {
         if (this.state === TransferState.CANCELLED) {
@@ -345,13 +474,20 @@ export class HdcFileReceiver extends HdcFileTransfer {
 
           const payload = parsed.payload;
 
-          if (expectingInfo) {
-            // First packet contains file info
-            const info = payload.toString();
-            const match = info.match(/^file:info:(\d+)$/);
-            if (match) {
-              this.totalBytes = parseInt(match[1], 10);
-              expectingInfo = false;
+          if (expectingConfig) {
+            // First packet contains TransferConfig (protobuf)
+            try {
+              const config = decodeTransferConfig(payload);
+              this.totalBytes = config.fileSize;
+              expectingConfig = false;
+            } catch {
+              // Fallback: try legacy text format
+              const info = payload.toString();
+              const match = info.match(/^file:info:(\d+)$/);
+              if (match) {
+                this.totalBytes = parseInt(match[1], 10);
+                expectingConfig = false;
+              }
             }
             return;
           }
@@ -370,9 +506,24 @@ export class HdcFileReceiver extends HdcFileTransfer {
             return;
           }
 
-          // Write file data
-          this.fileStream?.write(payload);
-          this.bytesTransferred += payload.length;
+          // Try to parse TransferPayload header (16 bytes) from chunk
+          if (payload.length >= TRANSFER_PAYLOAD_SIZE) {
+            const tpHeader = decodeTransferPayload(payload);
+            if (tpHeader !== null) {
+              // Strip the 16-byte header and write the actual data
+              const fileData = payload.subarray(TRANSFER_PAYLOAD_SIZE);
+              this.fileStream?.write(fileData);
+              this.bytesTransferred += fileData.length;
+            } else {
+              // No valid header, write raw data
+              this.fileStream?.write(payload);
+              this.bytesTransferred += payload.length;
+            }
+          } else {
+            // Small payload, write as-is
+            this.fileStream?.write(payload);
+            this.bytesTransferred += payload.length;
+          }
           this.emitProgress();
 
           // Check if complete
@@ -402,6 +553,154 @@ export class HdcFileReceiver extends HdcFileTransfer {
       });
     });
   }
+}
+
+// ============================================================================
+// Directory Transfer with TAR headers
+// ============================================================================
+
+/**
+ * Send a directory to the device using TAR headers.
+ * Each file gets a TAR header followed by file data, padded to 512-byte blocks.
+ */
+export async function sendDirectory(
+  socket: net.Socket,
+  localDir: string,
+  remoteDir: string,
+  options?: TransferOptions
+): Promise<void> {
+  const dirStats = await fs.promises.stat(localDir);
+  if (!dirStats.isDirectory()) {
+    throw new Error(`Not a directory: ${localDir}`);
+  }
+
+  // Build list of all entries (files and directories) for TAR
+  const entries = listAllEntries(localDir);
+
+  // Send directory init with TransferConfig
+  const dirConfig: TransferConfig = {
+    fileSize: 0,
+    atime: Math.floor(dirStats.atimeMs / 1000),
+    mtime: Math.floor(dirStats.mtimeMs / 1000),
+    options: '',
+    path: remoteDir,
+    optionalName: path.basename(localDir),
+    updateIfNew: options?.updateIfNew ?? false,
+    compressType: options?.compress ? COMPRESS_GZIP : COMPRESS_NONE,
+    holdTimestamp: options?.preserveTimestamp ?? false,
+    functionName: 'dirsend',
+    clientCwd: process.cwd(),
+    reserve1: '',
+    reserve2: '',
+  };
+  const configBuf = encodeTransferConfig(dirConfig);
+  const configPacket = createPacket(configBuf, fileProtect(CommandId.CMD_DIR_MODE));
+  socket.write(configPacket);
+
+  // Send each entry as a TAR header + data
+  for (const entry of entries) {
+    const relativePath = path.relative(localDir, entry.fullPath).replace(/\\/g, '/');
+    const tarPath = relativePath;
+
+    const stats = await fs.promises.stat(entry.fullPath);
+
+    if (entry.isDirectory) {
+      // Send directory TAR header
+      const tarHeader: TarHeader = {
+        filename: tarPath + '/',
+        fileSize: 0,
+        mtime: Math.floor(stats.mtimeMs / 1000),
+        typeFlag: '5',
+        prefix: '',
+      };
+      const headerBuf = encodeTarHeader(tarHeader);
+      const packet = createPacket(headerBuf, fileProtect(CommandId.CMD_FILE_DATA));
+      socket.write(packet);
+    } else {
+      // Send file TAR header + data
+      const tarHeader: TarHeader = {
+        filename: tarPath,
+        fileSize: stats.size,
+        mtime: Math.floor(stats.mtimeMs / 1000),
+        typeFlag: '0',
+        prefix: '',
+      };
+      const headerBuf = encodeTarHeader(tarHeader);
+      const headerPacket = createPacket(headerBuf, fileProtect(CommandId.CMD_FILE_DATA));
+      socket.write(headerPacket);
+
+      // Send file data in chunks, padded to 512-byte blocks
+      const chunkSize = options?.serverHugeBuffer
+        ? HIGH_SPEED_CHUNK_SIZE
+        : (options?.chunkSize || DEFAULT_CHUNK_SIZE);
+
+      await new Promise<void>((resolve, reject) => {
+        const stream = fs.createReadStream(entry.fullPath, { highWaterMark: chunkSize });
+        let chunkIndex = 0;
+
+        stream.on('data', (chunk: string | Buffer) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+
+          // Add TransferPayload header
+          const payloadHeader: TransferPayload = {
+            index: chunkIndex,
+            compressType: options?.compress ? COMPRESS_GZIP : COMPRESS_NONE,
+            compressSize: buf.length,
+            uncompressSize: buf.length,
+          };
+          const headerBytes = encodeTransferPayload(payloadHeader);
+          const combined = Buffer.concat([headerBytes, buf]);
+          const packet = createPacket(combined, fileProtect(CommandId.CMD_FILE_DATA));
+          socket.write(packet);
+          chunkIndex++;
+        });
+
+        stream.on('end', () => {
+          // Pad to 512-byte boundary
+          const remainder = stats.size % TAR_HEADER_SIZE;
+          if (remainder > 0) {
+            const paddingSize = TAR_HEADER_SIZE - remainder;
+            const padding = Buffer.alloc(paddingSize, 0);
+            const padPacket = createPacket(padding, fileProtect(CommandId.CMD_FILE_DATA));
+            socket.write(padPacket);
+          }
+          resolve();
+        });
+
+        stream.on('error', reject);
+      });
+    }
+  }
+
+  // Send end-of-archive marker (two 512-byte zero blocks)
+  const eofBlock = Buffer.alloc(TAR_HEADER_SIZE * 2, 0);
+  const eofPacket = createPacket(eofBlock, fileProtect(CommandId.CMD_FILE_FINISH));
+  socket.write(eofPacket);
+}
+
+/**
+ * List all files and directories recursively.
+ */
+interface DirEntry {
+  fullPath: string;
+  isDirectory: boolean;
+}
+
+function listAllEntries(dir: string): DirEntry[] {
+  const entries: DirEntry[] = [];
+  const items = fs.readdirSync(dir, { withFileTypes: true });
+
+  for (const item of items) {
+    const fullPath = path.join(dir, item.name);
+    if (item.isDirectory()) {
+      entries.push({ fullPath, isDirectory: true });
+      entries.push(...listAllEntries(fullPath));
+    } else {
+      entries.push({ fullPath, isDirectory: false });
+    }
+  }
+
+  return entries;
 }
 
 // ============================================================================
@@ -443,12 +742,13 @@ export async function getFileInfo(filePath: string): Promise<FileInfo> {
     path: filePath,
     size: stats.size,
     mtime: stats.mtime,
+    atime: stats.atime,
     isDirectory: stats.isDirectory(),
   };
 }
 
 /**
- * List files in directory
+ * List files in directory (files only, recursive)
  */
 export function listFiles(dir: string): string[] {
   const files: string[] = [];
@@ -467,19 +767,48 @@ export function listFiles(dir: string): string[] {
 }
 
 /**
- * Send directory to device
+ * Parse file transfer flags from CLI arguments.
+ * Supports: -a (holdTimestamp), -z (compress), -sync (updateIfNew), -m (directory mode)
  */
-export async function sendDirectory(
-  socket: net.Socket,
-  localDir: string,
-  remoteDir: string,
-  options?: TransferOptions
-): Promise<void> {
-  const files = listFiles(localDir);
+export function parseFileTransferFlags(args: string[]): { flags: FileTransferFlags; remaining: string[] } {
+  const flags: FileTransferFlags = {
+    holdTimestamp: false,
+    compress: false,
+    updateIfNew: false,
+    directoryMode: false,
+  };
+  const remaining: string[] = [];
 
-  for (const file of files) {
-    const relativePath = path.relative(localDir, file);
-    const remotePath = `${remoteDir}/${relativePath}`.replace(/\\/g, '/');
-    await sendFile(socket, file, remotePath, options);
+  for (const arg of args) {
+    switch (arg) {
+      case '-a':
+        flags.holdTimestamp = true;
+        break;
+      case '-z':
+        flags.compress = true;
+        break;
+      case '-sync':
+        flags.updateIfNew = true;
+        break;
+      case '-m':
+        flags.directoryMode = true;
+        break;
+      default:
+        remaining.push(arg);
+        break;
+    }
   }
+
+  return { flags, remaining };
+}
+
+/**
+ * Convert FileTransferFlags to TransferOptions
+ */
+export function flagsToOptions(flags: FileTransferFlags): TransferOptions {
+  return {
+    preserveTimestamp: flags.holdTimestamp,
+    compress: flags.compress,
+    updateIfNew: flags.updateIfNew,
+  };
 }
