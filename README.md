@@ -30,6 +30,7 @@ hdc shell ls -la /data/local/tmp
 
 # File transfer
 hdc file send ./local.txt /data/local/tmp/
+hdc file recv /data/local/tmp/remote.txt        # defaults to current dir
 hdc file recv /data/local/tmp/remote.txt ./
 
 # Port forwarding
@@ -129,7 +130,8 @@ hdc list targets              # 列出已连接设备
 hdc shell                     # 交互式 Shell
 hdc shell ls /data/local/tmp  # 执行单条命令
 hdc file send ./app.hap /data/local/tmp/  # 推送文件
-hdc file recv /data/log.txt ./             # 拉取文件
+hdc file recv /data/log.txt               # 拉取文件到当前目录
+hdc file recv /data/log.txt ./            # 指定本地路径
 hdc install /path/to/app.hap  # 安装应用
 hdc hilog                     # 查看设备日志
 hdc start                     # 启动服务端

@@ -267,6 +267,13 @@ async function runClient(parsed: ParsedCommand): Promise<void> {
     return;
   }
 
+  // Default local path for file recv when only remote path given
+  if (parsed.command === 'file' && parsed.args[0] === 'recv' && parsed.args.length === 2) {
+    const remotePath = parsed.args[1];
+    const localName = path.basename(remotePath);
+    parsed.args.push(path.resolve(localName));
+  }
+
   try {
     // Build command string from parsed result and send to server
     const commandStr = buildCommandString(parsed);
