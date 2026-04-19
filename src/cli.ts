@@ -150,9 +150,43 @@ async function checkServerAlive(host: string, port: number): Promise<boolean> {
 }
 
 /**
+ * Find the official hdc binary in PATH.
+ */
+function findOfficialHdc(): string | null {
+  try {
+    const result = child_process.execSync('which hdc 2>/dev/null', {
+      encoding: 'utf8',
+      timeout: 2000,
+    }).trim();
+    return result || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Spawn the HDC server process in the background.
+ * Prefers the official hdc binary when available — it supports USB device
+ * discovery which the Node.js server cannot do without native modules.
  */
 async function pullupServer(host: string, port: number): Promise<void> {
+  const officialHdc = findOfficialHdc();
+  if (officialHdc) {
+    try {
+      const child = child_process.spawn(officialHdc, ['start'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      await new Promise((r) => setTimeout(r, 500));
+      const alive = await checkServerAlive(host, port);
+      if (alive) return;
+    } catch {
+      // Official hdc start failed, fall through to Node.js server
+    }
+  }
+
+  // Fallback: start our Node.js server (limited — no USB device discovery)
   const serverArgs = ['-m', '-s', `${host}:${port}`];
 
   const child = child_process.spawn(process.execPath, [
@@ -226,6 +260,13 @@ async function runClient(parsed: ParsedCommand): Promise<void> {
 
   await client.connect();
 
+  // Interactive shell mode: `shell` with no command arguments
+  const isInteractiveShell = parsed.command === 'shell' && parsed.args.length === 0;
+  if (isInteractiveShell) {
+    await runInteractiveShell(client);
+    return;
+  }
+
   try {
     // Build command string from parsed result and send to server
     const commandStr = buildCommandString(parsed);
@@ -241,6 +282,59 @@ async function runClient(parsed: ParsedCommand): Promise<void> {
   } finally {
     await client.disconnect();
   }
+}
+
+/**
+ * Run an interactive shell session.
+ * Keeps the TCP connection open and streams stdin/stdout bidirectionally.
+ */
+async function runInteractiveShell(client: HdcClient): Promise<void> {
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  let wasRaw = false;
+  let resolved = false;
+
+  const cleanup = () => {
+    if (resolved) return;
+    resolved = true;
+    if (wasRaw) {
+      try { stdin.setRawMode(false); } catch { /* ignore */ }
+    }
+    stdin.removeListener('data', onStdin);
+    stdin.pause();
+    client.off('response', onResponse);
+    client.disconnect().catch(() => {});
+  };
+
+  // Pipe server responses to stdout
+  const onResponse = (data: Buffer) => {
+    stdout.write(data);
+  };
+  client.on('response', onResponse);
+
+  // Send the shell command (interactive: no sub-command)
+  client.send(Buffer.from('shell\0'));
+
+  // Set stdin to raw mode for proper terminal handling
+  if (stdin.isTTY) {
+    stdin.setRawMode(true);
+    wasRaw = true;
+  }
+  stdin.resume();
+
+  // Pipe stdin data to server as length-prefixed frames
+  const onStdin = (data: Buffer) => {
+    client.send(data);
+  };
+  stdin.on('data', onStdin);
+
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      cleanup();
+      resolve();
+    };
+    client.on('close', done);
+  });
 }
 
 // ============================================================================
@@ -276,6 +370,8 @@ async function runKill(parsed: ParsedCommand): Promise<void> {
       // Process may already be dead
       console.log('Kill server finish');
     }
+    // Clean up PID file (SIGKILL doesn't trigger server's shutdown handler)
+    try { fs.unlinkSync(SERVER_PID_FILE); } catch { /* ignore */ }
   } else {
     // No PID file — try connecting and see if server responds
     const addr = parsed.serverAddr || getDefaultServerAddress();
